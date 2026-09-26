@@ -138,7 +138,9 @@ in `setup()`, the same way `SCRIPTLOAD` does it internally. See
 
 Bytecode transport is hex over the command processor's existing ASCII line
 protocol, not a new binary framing — `gsc.py --scriptload --format hex`
-already produces exactly what `SCRIPTLOAD` expects.
+already produces exactly what `SCRIPTLOAD` expects. See
+[WORKFLOW.md](WORKFLOW.md) for the concrete write/compile/download/iterate
+steps.
 
 **Not yet built**: persisting a loaded script across a reboot (RAM-only for
 now — see `USBrepeater/TODO.md` for the filesystem-based
