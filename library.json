@@ -1,0 +1,23 @@
+{
+  "name": "GAACE_Script",
+  "version": "0.1.0",
+  "description": "Minimal stack-based bytecode VM for host-downloadable control scripts on GAACE firmware. No heap, no GC, no board-specific code in the core — extended per project via a syscall table.",
+  "keywords": ["vm", "bytecode", "scripting", "interpreter", "control"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GordonAnderson/GAACE_Script"
+  },
+  "authors": [
+    {
+      "name": "Gordon Anderson",
+      "url": "https://gaacustom.com",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": "arduino",
+  "platforms": "*",
+  "build": {
+    "srcDir": "src"
+  }
+}
