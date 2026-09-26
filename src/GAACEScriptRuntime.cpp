@@ -4,6 +4,7 @@
 #include "GAACEScriptHex.h"
 #include <Errors.h>
 #include <stdio.h>
+#include <stdlib.h>  // atoi()
 
 namespace GAACEScript {
 
@@ -19,6 +20,34 @@ void ScriptSlot::run() {
 // Limitations note (same convention threadCommands uses).
 static ScriptRuntime *activeInstance = nullptr;
 
+// -----------------------------------------------------------------------
+// cmd() bridge -- lets any script in any slot call into the project's own
+// commandProcessor by name (see GAACEScript.h's CMDCALL/CmdBridgeFn docs
+// and tools/README.md's cmd() language section). Builds "NAME,arg0,arg1"
+// and runs it through executeLine() (GAACE_Core), which never touches the
+// shared ring buffer/output stream a real command might be mid-arriving
+// on -- see that method's own doc comment for why that isolation matters.
+//
+// Return value: the response parsed as a number on ACK, 0 on NAK or a
+// response with no trailing number (e.g. a plain action command). NAK and
+// "ACK with value 0" are not distinguishable from the return value alone.
+// -----------------------------------------------------------------------
+static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc) {
+  commandProcessor &cp = *activeInstance->cp_;
+
+  char line[64];
+  int len = snprintf(line, sizeof(line), "%s", name);
+  for (uint8_t i = 0; i < argc && len < (int)sizeof(line) - 1; i++) {
+    len += snprintf(line + len, sizeof(line) - (size_t)len, ",%d", (int)args[i]);
+  }
+
+  char response[48];
+  cp.executeLine(line, response, sizeof(response));
+
+  if ((uint8_t)response[0] == 0x06) return (int32_t)atoi(response + 1);
+  return 0;
+}
+
 ScriptRuntime::ScriptRuntime(commandProcessor *cpArg, ThreadController *tasks,
                               unsigned long defaultIntervalMs) {
   activeInstance = this;
@@ -28,6 +57,7 @@ ScriptRuntime::ScriptRuntime(commandProcessor *cpArg, ThreadController *tasks,
     snprintf(name, sizeof(name), "Script%u", (unsigned)i);
     slots[i].setName(name);
     slots[i].setInterval(defaultIntervalMs);
+    vmSetCmdBridge(slots[i].vm, cmdBridge);  // cmd() works in every slot, free
     tasks->add(&slots[i]);
   }
 }
@@ -41,9 +71,13 @@ uint8_t ScriptRuntime::registerSyscall(SyscallFn fn) {
 }
 
 // -----------------------------------------------------------------------
-// SCRIPTLOAD,<slot>,<hex> — decode <hex> into slots[slot].code and vmInit()
-// it. NAKs (ERR_BADARG) on a bad slot index, malformed hex (odd length or a
-// non-hex character), or a decoded length over SCRIPT_MAX_CODE_LEN.
+// SCRIPTLOAD,<slot>,<hex> — decode <hex> into slots[slot].code and load it.
+// <hex> carries [codeLen:u16 LE][code bytes][pool bytes] -- pool is
+// whatever's left after codeLen code bytes, empty for a script that
+// doesn't use cmd() (see gsc.py --scriptload, which produces exactly this
+// layout). NAKs (ERR_BADARG) on a bad slot index, malformed hex, a
+// decoded length over SCRIPT_MAX_CODE_LEN, or a codeLen prefix that
+// doesn't fit within what was actually decoded.
 // -----------------------------------------------------------------------
 static void cmdScriptLoad(void) {
   commandProcessor &cp = *activeInstance->cp_;
@@ -66,10 +100,17 @@ static void cmdScriptLoad(void) {
   bool ok = hexDecode(hex, s.code, SCRIPT_MAX_CODE_LEN, decodedLen);
   cp.ca->free(hex);
 
-  if (!ok) { cp.sendNAK(ERR_BADARG); return; }
+  if (!ok || decodedLen < 2) { cp.sendNAK(ERR_BADARG); return; }
 
-  s.codeLen = decodedLen;
-  vmInit(s.vm, s.code, s.codeLen);
+  uint16_t codeLen = (uint16_t)((uint8_t)s.code[0] | ((uint8_t)s.code[1] << 8));
+  if (codeLen > decodedLen - 2) { cp.sendNAK(ERR_BADARG); return; }
+  uint16_t poolLen = (uint16_t)(decodedLen - 2 - codeLen);
+
+  s.codeLen = codeLen;
+  vmInit(s.vm, s.code + 2, codeLen);
+  // Always called, even for poolLen 0: a slot being reloaded with a script
+  // that has no pool must not keep pointing at a previous script's pool.
+  vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
   s.loaded = true;
   s.lastStatus = VM_OK;
   cp.sendACK();

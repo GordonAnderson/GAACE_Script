@@ -21,7 +21,8 @@ namespace GAACEScript {
 //   OP_PUSH_I32 / OP_PUSH_F32 <4 bytes>  5 bytes total
 //   OP_LOAD/STORE <slot>                 2 bytes total
 //   OP_JMP/JZ/JNZ <u16 abs>              3 bytes total (absolute, not relative)
-//   OP_CALL <id> <argc>                  3 bytes total
+//   OP_CALL <id> <argc>                   3 bytes total
+//   OP_CMDCALL <poolOffset:u16> <argc>    4 bytes total
 //   everything else                      1 byte (no operand)
 //
 // Floats: a stack/variable slot is just 4 bytes with no type tag anywhere --
@@ -31,6 +32,18 @@ namespace GAACEScript {
 // it's the opcode, not the value, that carries the type. The compiler
 // (gsc.py) is responsible for emitting the right opcode for each operand's
 // static type; the VM itself does no runtime type checking.
+//
+// CMDCALL: lets a script invoke a literal, human-readable command name
+// (e.g. `cmd("SADCPIN", pin);`) against whatever command surface the
+// embedding project already exposes to a PC/human -- rather than a fixed
+// set of hand-written syscalls, a script gets access to anything already
+// registered with the project's command processor. The name lives in a
+// read-only string-constant pool compiled alongside the code (see `pool`/
+// `poolLen` below and vmSetPool()); poolOffset is a byte offset to a
+// NUL-terminated string within it. The VM core still has zero
+// hardware-specific code -- it hands (name, args, argc) to a single
+// registered CmdBridgeFn and pushes back whatever int32 comes out. See
+// GAACEScriptRuntime.h for the real bridge (into commandProcessor).
 // ---------------------------------------------------------------------------
 enum Opcode : uint8_t {
   OP_HALT = 0x00,
@@ -72,6 +85,7 @@ enum Opcode : uint8_t {
   OP_FGE,
   OP_I2F,   // pop int32, push its float32 conversion
   OP_F2I,   // pop float32, push its int32 truncation (toward zero)
+  OP_CMDCALL,
 };
 
 enum Status : uint8_t {
@@ -86,6 +100,10 @@ enum Status : uint8_t {
   VM_ERR_STEP_LIMIT,       // maxSteps reached without halting — script did not
                            // finish in this call; embedding project decides
                            // whether that's an error or expected (see below)
+  VM_ERR_BAD_POOL,         // CMDCALL's poolOffset is out of range, or the
+                           // string at that offset isn't NUL-terminated
+                           // within the pool
+  VM_ERR_NO_CMD_BRIDGE,    // CMDCALL used but vmSetCmdBridge() was never called
 };
 
 // Overridable per project (e.g. -D GAACE_SCRIPT_STACK_SIZE=64 in
@@ -110,6 +128,12 @@ static const uint8_t MAX_SYSCALLS = GAACE_SCRIPT_MAX_SYSCALLS;
 // argument pushed) and returns one int32_t that gets pushed back.
 typedef int32_t (*SyscallFn)(int32_t *args, uint8_t argc);
 
+// The CMDCALL bridge: `name` is a NUL-terminated string from the VM's pool
+// (e.g. "SADCPIN"); args/argc are the script's arguments, same convention
+// as SyscallFn. Exactly one bridge per VM (not a table -- there's only ever
+// one "the command processor" to reach), registered with vmSetCmdBridge().
+typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc);
+
 struct VM {
   int32_t stack[STACK_SIZE];
   int32_t vars[VAR_SLOTS];
@@ -120,16 +144,33 @@ struct VM {
 
   SyscallFn syscalls[MAX_SYSCALLS];
   uint8_t syscallCount = 0;
+
+  const uint8_t *pool = nullptr;
+  uint16_t poolLen = 0;
+  CmdBridgeFn cmdBridge = nullptr;
 };
 
 // Resets pc/stack/vars and points the VM at a bytecode buffer. Does not
-// touch the registered syscall table, so a VM instance can be reused for
-// many scripts against the same syscall set.
+// touch the registered syscall table, the pool, or the command bridge, so
+// a VM instance can be reused for many scripts against the same syscall
+// set -- but see vmSetPool()'s note about reloading when scripts differ.
 void vmInit(VM &vm, const uint8_t *code, uint16_t codeLen);
 
 // Registers a syscall, returning its id (used as the CALL operand), or
 // 0xFF if the table is full.
 uint8_t vmRegisterSyscall(VM &vm, SyscallFn fn);
+
+// Points the VM at a script's string-constant pool (for CMDCALL). Like
+// vmInit(), does not allocate or copy -- `pool` must outlive its use.
+// Call this every time a *different* script is loaded into a reused VM
+// instance, even with poolLen 0, so a stale pointer from a previous
+// script's pool can't be read through this one's (possibly different)
+// CMDCALL offsets.
+void vmSetPool(VM &vm, const uint8_t *pool, uint16_t poolLen);
+
+// Registers the single CMDCALL bridge for this VM instance (see
+// CmdBridgeFn above). Not touched by vmInit()/vmSetPool().
+void vmSetCmdBridge(VM &vm, CmdBridgeFn fn);
 
 // Runs up to maxSteps instructions. Intended to be called from a
 // cooperative scheduler (e.g. ArduinoThread) the same way ADCThread runs

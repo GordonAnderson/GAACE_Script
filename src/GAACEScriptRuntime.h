@@ -20,19 +20,33 @@
 // and querying limits/status, which threadCommands has no notion of.
 //
 // New commands (see GAACEScriptRuntime.cpp for exact behavior):
-//   SCRIPTLOAD,<slot>,<hex>   Decode <hex> and load it into <slot>. NAKs
-//                             (ERR_BADARG) on a bad slot index, malformed
-//                             hex, or a decoded length over the per-project
-//                             GAACE_SCRIPT_MAX_CODE_LEN limit.
+//   SCRIPTLOAD,<slot>,<hex>   Decode <hex> ([codeLen:u16][code][pool] -- see
+//                             gsc.py --scriptload) and load it into <slot>.
+//                             NAKs (ERR_BADARG) on a bad slot index,
+//                             malformed hex, or a decoded payload over the
+//                             per-project GAACE_SCRIPT_MAX_CODE_LEN limit.
 //   GSCRIPTLIMITS             slots,maxCodeLen,stackSize,varSlots,maxSyscalls
+//                             (maxCodeLen is the SCRIPTLOAD payload budget,
+//                             i.e. the 2-byte length prefix + code + pool
+//                             combined, not code alone)
 //   GSCRIPTST,<slot>          loaded(0|1),lastStatus  (see GAACEScript.h's
 //                             Status enum; 1 = VM_HALTED)
+//
+// cmd() support: every slot gets a working CMDCALL bridge automatically
+// (registered in the constructor below) -- a script anywhere can call
+// cmd("SOMECOMMAND", args...) against whatever this project's own
+// commandProcessor already exposes, with no per-project wiring beyond
+// constructing ScriptRuntime itself. See GAACEScript.h (CmdBridgeFn/
+// vmSetPool) and GAACE_Core's commandProcessor::executeLine() for how.
 //
 // Build configuration
 // --------------------
 //   -D GAACE_SCRIPT_SLOTS=<n>          Number of script slots (default 4).
-//   -D GAACE_SCRIPT_MAX_CODE_LEN=<n>   Max bytecode bytes per slot (default
-//                                      128). NOTE: SCRIPTLOAD's hex argument
+//   -D GAACE_SCRIPT_MAX_CODE_LEN=<n>   Max SCRIPTLOAD payload bytes per slot
+//                                      (default 128) -- the 2-byte length
+//                                      prefix, code, and pool (if the
+//                                      script uses cmd()) combined, not
+//                                      code alone. NOTE: SCRIPTLOAD's hex argument
 //                                      is decoded through commandProcessor's
 //                                      shared charAllocate scratch arena,
 //                                      which is a fixed 512 bytes across the

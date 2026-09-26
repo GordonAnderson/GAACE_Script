@@ -56,15 +56,55 @@ if (sum > 10) {
 - A bare call used as a statement (e.g. `print(x);`) discards its return
   value.
 
+### `cmd()` — calling into the command processor directly
+
+```
+cmd("SADCPIN", 5);            // fire-and-forget: send SADCPIN,5
+result = cmd("GVER");         // GET-style: no args, capture the response
+```
+
+Instead of a hand-written syscall per capability, `cmd("NAME", args...)`
+invokes command `NAME` against whatever the embedding project's
+`commandProcessor` already exposes — anything a PC/human could type, a
+script can call, with zero per-project wiring (`GAACEScriptRuntime.h`'s
+`ScriptRuntime` registers the bridge automatically on every slot).
+
+- The literal name is stored once in a string-constant pool compiled
+  alongside the code; repeated calls with the same name share one copy.
+  The VM core never touches the string itself — `CMDCALL` carries a pool
+  offset, and the actual dispatch happens in GAACE_Core's
+  `commandProcessor::executeLine()`, which runs the line through the same
+  logic a real typed command uses, in complete isolation from whatever a
+  human/PC might be mid-typing into the shared input buffer at that same
+  moment.
+- Returns an `int`: the response parsed as a number on ACK, `0` on NAK or
+  if the response has no trailing number (e.g. a plain action command with
+  no return value). NAK and "ACK with value 0" aren't distinguishable from
+  the return value alone.
+- Arguments aren't type-checked (same as syscalls); floats can be passed,
+  the receiving command decides how to interpret them.
+- A script that uses `cmd()` compiles to *two* artifacts — code and pool —
+  see `--scriptload` below for the wire format that combines them for
+  `SCRIPTLOAD`, or use `--format carray` to get both as separate arrays for
+  hand-written `vmInit()`/`vmSetPool()` calls.
+
 ## Usage
 
 ```
-python3 gsc.py program.gs -o program.bin              # raw bytecode
-python3 gsc.py program.gs --format hex                 # ASCII hex to stdout
+python3 gsc.py program.gs -o program.bin              # raw bytecode (code only;
+                                                        # warns if the script uses
+                                                        # cmd() and drops the pool)
+python3 gsc.py program.gs --format hex                 # ASCII hex to stdout (same
+                                                        # code-only caveat as above)
 python3 gsc.py program.gs --format carray --carray-name script
-                                                        # C array, for pasting
-                                                        # straight into firmware
-python3 gsc.py program.gs --disasm                     # print disassembly
+                                                        # C arrays: script[]/script_len,
+                                                        # plus script_pool[]/script_pool_len
+                                                        # if the script uses cmd()
+python3 gsc.py program.gs --scriptload --format hex    # [codeLen][code][pool] combined --
+                                                        # paste straight into
+                                                        # SCRIPTLOAD,<slot>,<hex>
+python3 gsc.py program.gs --disasm                     # print disassembly (shows cmd()
+                                                        # names resolved from the pool)
 ```
 
 ## Tests

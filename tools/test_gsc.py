@@ -52,14 +52,36 @@ static int32_t sys_set_max_drive(int32_t *args, uint8_t argc) {
   return 0;
 }
 
-int main(int argc, char **argv) {
-  int reps = (argc > 2) ? atoi(argv[2]) : 1;
-  FILE *f = fopen(argv[1], "rb");
-  std::vector<uint8_t> buf; uint8_t b;
+// Fake cmd() bridge: prints "CMD:<name>,<arg0>,<arg1>,...\n" so tests can
+// verify the right name/args reached it, and returns a fixed value the
+// script can act on.
+static int32_t fake_cmd_bridge(const char *name, int32_t *args, uint8_t argc) {
+  printf("CMD:%s", name);
+  for (uint8_t i = 0; i < argc; i++) printf(",%d", args[i]);
+  printf("\n");
+  return 123;
+}
+
+static std::vector<uint8_t> readFile(const char *path) {
+  std::vector<uint8_t> buf;
+  FILE *f = fopen(path, "rb");
+  if (!f) return buf;
+  uint8_t b;
   while (fread(&b, 1, 1, f) == 1) buf.push_back(b);
   fclose(f);
+  return buf;
+}
+
+int main(int argc, char **argv) {
+  // argv: <codefile> <poolfile> <reps>
+  int reps = (argc > 3) ? atoi(argv[3]) : 1;
+  std::vector<uint8_t> code = readFile(argv[1]);
+  std::vector<uint8_t> pool = readFile(argv[2]);
+
   VM vm;
-  vmInit(vm, buf.data(), (uint16_t)buf.size());
+  vmInit(vm, code.data(), (uint16_t)code.size());
+  vmSetPool(vm, pool.data(), (uint16_t)pool.size());
+  vmSetCmdBridge(vm, fake_cmd_bridge);
   vmRegisterSyscall(vm, sys_print);
   vmRegisterSyscall(vm, sys_printf);
   vmRegisterSyscall(vm, sys_read_power);
@@ -139,6 +161,26 @@ class StructuralTests(unittest.TestCase):
         code = gsc.compile_source("syscall watts() : float = 0; x = watts() + 1.0;")
         self.assertIn(gsc.OP_FADD, code)
 
+    def test_cmd_call_emits_cmdcall_and_pool_entry(self):
+        code, pool = gsc.compile_source_with_pool('cmd("SADCPIN", 5);')
+        self.assertIn(gsc.OP_CMDCALL, code)
+        self.assertEqual(pool, b"SADCPIN\x00")
+
+    def test_cmd_call_dedupes_repeated_names(self):
+        code, pool = gsc.compile_source_with_pool(
+            'cmd("SADCPIN", 5); cmd("SADCPIN", 6);')
+        self.assertEqual(pool, b"SADCPIN\x00")  # one copy, not two
+
+    def test_cmd_call_with_no_args(self):
+        code, pool = gsc.compile_source_with_pool('x = cmd("GVER");')
+        self.assertIn(gsc.OP_CMDCALL, code)
+        self.assertEqual(pool, b"GVER\x00")
+
+    def test_disassemble_shows_cmd_name_from_pool(self):
+        code, pool = gsc.compile_source_with_pool('cmd("SADCPIN", 5);')
+        text = gsc.disassemble(code, pool)
+        self.assertIn('CMDCALL "SADCPIN"', text)
+
 
 @unittest.skipUnless(shutil.which("g++"), "g++ not available")
 class EndToEndVmTests(unittest.TestCase):
@@ -160,11 +202,14 @@ class EndToEndVmTests(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def run_script(self, source, reps=1):
-        code = gsc.compile_source(source)
+        code, pool = gsc.compile_source_with_pool(source)
         bin_path = os.path.join(self.tmpdir, "prog.bin")
+        pool_path = os.path.join(self.tmpdir, "prog.pool.bin")
         with open(bin_path, "wb") as f:
             f.write(code)
-        result = subprocess.run([self.harness_bin, bin_path, str(reps)],
+        with open(pool_path, "wb") as f:
+            f.write(pool)
+        result = subprocess.run([self.harness_bin, bin_path, pool_path, str(reps)],
                                  capture_output=True, text=True, check=True)
         status_line = [l for l in result.stderr.splitlines() if l.startswith("STATUS:")][0]
         status = int(status_line.split(":")[1])
@@ -253,6 +298,23 @@ class EndToEndVmTests(unittest.TestCase):
         self.assertEqual(status, 1)
         # fixture: read_power()=125.0, max_drive()=80.0 -> 125>100, so 80-5=75
         self.assertEqual(lines, ["S75"])
+
+    def test_cmd_call_reaches_bridge_with_name_and_args(self):
+        status, lines = self.run_script("""
+            syscall print(v) = 0;
+            result = cmd("SADCPIN", 5, 6);
+            print(result);
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["CMD:SADCPIN,5,6", "123"])
+
+    def test_cmd_call_no_args_reaches_bridge(self):
+        status, lines = self.run_script("""
+            syscall print(v) = 0;
+            print(cmd("GVER"));
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["CMD:GVER", "123"])
 
 
 if __name__ == "__main__":

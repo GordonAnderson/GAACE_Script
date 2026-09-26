@@ -56,6 +56,12 @@ struct Asm {
   void call(uint8_t id, uint8_t argc) {
     buf[len++] = OP_CALL; buf[len++] = id; buf[len++] = argc;
   }
+  void cmdCall(uint16_t poolOffset, uint8_t argc) {
+    buf[len++] = OP_CMDCALL;
+    buf[len++] = (uint8_t)(poolOffset & 0xFF);
+    buf[len++] = (uint8_t)((poolOffset >> 8) & 0xFF);
+    buf[len++] = argc;
+  }
 };
 
 void setUp(void) {}
@@ -341,6 +347,92 @@ static void test_power_to_drive_example(void) {
   TEST_ASSERT_EQUAL_FLOAT(75.0f, lastSetDrive);  // 125 W > 100 W -> 80% - 5% = 75%
 }
 
+// ---------------------------------------------------------------------------
+// CMDCALL / string pool
+// ---------------------------------------------------------------------------
+
+static char lastBridgeName[32];
+static int32_t lastBridgeArgs[4];
+static uint8_t lastBridgeArgc;
+
+static int32_t fakeCmdBridge(const char *name, int32_t *args, uint8_t argc) {
+  strncpy(lastBridgeName, name, sizeof(lastBridgeName) - 1);
+  lastBridgeName[sizeof(lastBridgeName) - 1] = '\0';
+  lastBridgeArgc = argc;
+  for (uint8_t i = 0; i < argc && i < 4; i++) lastBridgeArgs[i] = args[i];
+  return 99;
+}
+
+static void test_cmdcall_invokes_bridge_with_name_and_args(void) {
+  static const uint8_t pool[] = "SADCPIN\0";  // offset 0, NUL-terminated
+  Asm a;
+  a.pushI32(5);
+  a.pushI32(6);
+  a.cmdCall(0, 2);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetCmdBridge(vm, fakeCmdBridge);
+
+  lastBridgeName[0] = '\0';
+  lastBridgeArgc = 0;
+  Status s = vmRun(vm, 100);
+
+  TEST_ASSERT_EQUAL(VM_HALTED, s);
+  TEST_ASSERT_EQUAL_STRING("SADCPIN", lastBridgeName);
+  TEST_ASSERT_EQUAL(2, lastBridgeArgc);
+  TEST_ASSERT_EQUAL_INT32(5, lastBridgeArgs[0]);
+  TEST_ASSERT_EQUAL_INT32(6, lastBridgeArgs[1]);
+  TEST_ASSERT_EQUAL_INT32(99, vm.stack[vm.sp - 1]);
+}
+
+static void test_cmdcall_without_bridge_registered_errors(void) {
+  static const uint8_t pool[] = "FOO\0";
+  Asm a;
+  a.cmdCall(0, 0);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  // no vmSetCmdBridge() call
+
+  Status s = vmRun(vm, 100);
+  TEST_ASSERT_EQUAL(VM_ERR_NO_CMD_BRIDGE, s);
+}
+
+static void test_cmdcall_offset_out_of_range_errors(void) {
+  static const uint8_t pool[] = "FOO\0";
+  Asm a;
+  a.cmdCall(100, 0);  // way past the 4-byte pool
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetCmdBridge(vm, fakeCmdBridge);
+
+  Status s = vmRun(vm, 100);
+  TEST_ASSERT_EQUAL(VM_ERR_BAD_POOL, s);
+}
+
+static void test_cmdcall_missing_terminator_errors(void) {
+  static const uint8_t pool[] = {'A', 'B', 'C'};  // no NUL anywhere
+  Asm a;
+  a.cmdCall(0, 0);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetCmdBridge(vm, fakeCmdBridge);
+
+  Status s = vmRun(vm, 100);
+  TEST_ASSERT_EQUAL(VM_ERR_BAD_POOL, s);
+}
+
 int main(int argc, char **argv) {
   UNITY_BEGIN();
   RUN_TEST(test_arithmetic_and_stack);
@@ -356,5 +448,9 @@ int main(int argc, char **argv) {
   RUN_TEST(test_int_to_float_and_back);
   RUN_TEST(test_float_div_by_zero_is_reported);
   RUN_TEST(test_power_to_drive_example);
+  RUN_TEST(test_cmdcall_invokes_bridge_with_name_and_args);
+  RUN_TEST(test_cmdcall_without_bridge_registered_errors);
+  RUN_TEST(test_cmdcall_offset_out_of_range_errors);
+  RUN_TEST(test_cmdcall_missing_terminator_errors);
   return UNITY_END();
 }

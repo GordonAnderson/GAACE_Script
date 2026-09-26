@@ -53,6 +53,15 @@ uint8_t vmRegisterSyscall(VM &vm, SyscallFn fn) {
   return vm.syscallCount++;
 }
 
+void vmSetPool(VM &vm, const uint8_t *pool, uint16_t poolLen) {
+  vm.pool = pool;
+  vm.poolLen = poolLen;
+}
+
+void vmSetCmdBridge(VM &vm, CmdBridgeFn fn) {
+  vm.cmdBridge = fn;
+}
+
 Status vmRun(VM &vm, uint16_t maxSteps) {
   for (uint16_t step = 0; step < maxSteps; step++) {
     if (vm.pc >= vm.codeLen) return VM_ERR_BAD_JUMP;
@@ -259,6 +268,33 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
         Status s = push(vm, r);
         if (s != VM_OK) return s;
         vm.pc += 3;
+        break;
+      }
+
+      case OP_CMDCALL: {
+        if ((uint32_t)vm.pc + 4 > vm.codeLen) return VM_ERR_BAD_JUMP;
+        uint16_t poolOffset = readU16(&vm.code[vm.pc + 1]);
+        uint8_t  argc       = vm.code[vm.pc + 3];
+
+        if (vm.cmdBridge == nullptr) return VM_ERR_NO_CMD_BRIDGE;
+        if (poolOffset >= vm.poolLen) return VM_ERR_BAD_POOL;
+
+        // Bounded scan for the NUL terminator -- never reads past poolLen,
+        // so a corrupt/truncated pool is reported, not walked off the end.
+        uint16_t end = poolOffset;
+        while (end < vm.poolLen && vm.pool[end] != '\0') end++;
+        if (end >= vm.poolLen) return VM_ERR_BAD_POOL;  // no terminator found
+
+        if (argc > vm.sp) return VM_ERR_STACK_UNDERFLOW;
+        int32_t args[STACK_SIZE];
+        for (int8_t i = (int8_t)argc - 1; i >= 0; i--) {
+          Status s = pop(vm, args[i]);
+          if (s != VM_OK) return s;
+        }
+        int32_t r = vm.cmdBridge((const char *)&vm.pool[poolOffset], args, argc);
+        Status s = push(vm, r);
+        if (s != VM_OK) return s;
+        vm.pc += 4;
         break;
       }
 

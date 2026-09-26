@@ -64,6 +64,18 @@ library from day one rather than a one-off inside a single project.
   identical VM core — proven by this repo's own examples, which build
   unmodified for both Teensy 4.1 and an Adafruit Feather M0 (SAMD21).
 
+- **`cmd()` reaches the command processor directly, with zero per-project
+  wiring.** Instead of a hand-written syscall per capability, a script can
+  call `cmd("SADCPIN", 5)` against anything the embedding project's
+  `commandProcessor` already exposes to a PC/human. The literal command
+  name lives in a string-constant pool compiled alongside the code (see
+  `CMDCALL`/`vmSetPool()` in `GAACEScript.h`); the actual dispatch runs
+  through GAACE_Core's `commandProcessor::executeLine()`, in complete
+  isolation from whatever a human/PC might be mid-typing into the shared
+  input buffer at that same moment. `ScriptRuntime` (below) wires this up
+  automatically for every slot — see tools/README.md's `cmd()` section for
+  the language side.
+
 - **The compiler lives on the host, not the device.** The firmware only
   ever needs the interpreter loop — there's no text parser on-device.
   `tools/gsc.py` compiles a small C-like script (variables, `if`/`else`,
@@ -102,7 +114,7 @@ only genuinely new commands are:
 
 | Command | Purpose |
 | --- | --- |
-| `SCRIPTLOAD,<slot>,<hex>` | Decode `<hex>` (as produced by `gsc.py --format hex`) and load it into `<slot>`. NAKs on a bad slot, malformed hex, or a script over the configured size limit — never silently accepts something it can't run. |
+| `SCRIPTLOAD,<slot>,<hex>` | Decode `<hex>` (`gsc.py --scriptload --format hex`, i.e. `[codeLen][code][pool]`) and load it into `<slot>`. NAKs on a bad slot, malformed hex, or a payload over the configured size limit — never silently accepts something it can't run. |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` — lets a host discover the compile-time limits below at runtime instead of hardcoding them. |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` — the one piece of VM-specific state `threadCommands` doesn't know about. |
 
@@ -113,7 +125,7 @@ forking anything:
 | Define | Default | What it controls |
 | --- | --- | --- |
 | `GAACE_SCRIPT_SLOTS` | 4 | Number of independent script slots (Threads) |
-| `GAACE_SCRIPT_MAX_CODE_LEN` | 128 | Max bytecode bytes per slot — see the header comment in `GAACEScriptRuntime.h` for why this interacts with `commandProcessor`'s fixed 512-byte scratch arena |
+| `GAACE_SCRIPT_MAX_CODE_LEN` | 128 | Max `SCRIPTLOAD` payload bytes per slot — the length prefix, code, *and* pool combined, not code alone. See the header comment in `GAACEScriptRuntime.h` for why this also interacts with `commandProcessor`'s fixed 512-byte scratch arena |
 | `GAACE_SCRIPT_STACK_SIZE` | 32 | VM operand stack depth |
 | `GAACE_SCRIPT_VAR_SLOTS` | 16 | Variable slots per script |
 | `GAACE_SCRIPT_MAX_SYSCALLS` | 32 | Syscall table size per VM |
@@ -125,8 +137,8 @@ in `setup()`, the same way `SCRIPTLOAD` does it internally. See
 `examples/BasicScript` for exactly that.
 
 Bytecode transport is hex over the command processor's existing ASCII line
-protocol, not a new binary framing — `gsc.py --format hex` already produces
-exactly what `SCRIPTLOAD` expects.
+protocol, not a new binary framing — `gsc.py --scriptload --format hex`
+already produces exactly what `SCRIPTLOAD` expects.
 
 **Not yet built**: persisting a loaded script across a reboot (RAM-only for
 now — see `USBrepeater/TODO.md` for the filesystem-based
@@ -137,10 +149,11 @@ specific to this module).
 ## Layout
 
 ```
-src/GAACEScript.{h,cpp}         VM core
+src/GAACEScript.{h,cpp}         VM core (now including CMDCALL/pool support)
 src/GAACEScriptHex.{h,cpp}      hex encode/decode (no Arduino dependency,
                                  natively testable)
-src/GAACEScriptRuntime.{h,cpp}  standard N-slot runtime + commands
+src/GAACEScriptRuntime.{h,cpp}  standard N-slot runtime + commands, incl.
+                                 the real cmd() bridge into executeLine()
                                  (Arduino-only; compiles to nothing under
                                  `platform = native`)
 lib/GAACE_Script_core           symlink to ../src, so PlatformIO's Library
@@ -149,6 +162,8 @@ lib/GAACE_Script_core           symlink to ../src, so PlatformIO's Library
 examples/BasicScript/            bounded loop + if/else + syscall round-trip,
                                  loaded into ScriptRuntime slot 0
 test/test_vm/, test/test_hex/    native unit tests (Unity), no hardware
+test/test_runtime/               on-device capstone test (real commandProcessor,
+                                 not a fake bridge) -- runs on adafruit_qt_py_m0
 tools/gsc.py                    host-side compiler (script source -> bytecode)
 tools/test_gsc.py               compiler tests, including end-to-end runs
                                  against the real VM
@@ -157,9 +172,10 @@ tools/test_gsc.py               compiler tests, including end-to-end runs
 ## Building
 
 ```
-pio test -e native                        # unit tests, no hardware
-pio run -e teensy41 -t upload             # BasicScript example, Teensy 4.1
-pio run -e adafruit_feather_m0 -t upload  # BasicScript example, SAMD21
+pio test -e native                                    # unit tests, no hardware
+pio run -e teensy41 -t upload                         # BasicScript example, Teensy 4.1
+pio run -e adafruit_feather_m0 -t upload              # BasicScript example, SAMD21
+pio test -e adafruit_qt_py_m0 --upload-port <port>    # on-device cmd()/executeLine() test
 ```
 
 ## Using it in another project
@@ -174,9 +190,16 @@ wherever you'd otherwise have hardcoded the behavior.
 
 ## Status
 
-VM core, compiler, and standard runtime are implemented and tested.
+VM core, compiler, standard runtime, and `cmd()` (scripts calling directly
+into the command processor via GAACE_Core's `executeLine()`) are
+implemented and tested — including on real hardware: `test/test_runtime`
+proves the full chain (a `gsc.py --scriptload`-compiled script, loaded via
+a real `SCRIPTLOAD` command, calling `cmd()` into a real `Command` table)
+on an Adafruit QT Py M0, not just against a fake bridge.
+
 Integrated into [USBrepeater](https://github.com/GordonAnderson/USBrepeater)
 as a real (if still demo-scoped) feature — see its `TODO.md` for what's
 still open there (script persistence across reboot, a boot-notification
-primitive, real-hardware validation). License is still an open decision
-(placeholder `MIT` in `library.json`), intentionally not settled yet.
+primitive, real-hardware validation of that specific integration). License
+is still an open decision (placeholder `MIT` in `library.json`),
+intentionally not settled yet.

@@ -29,7 +29,8 @@ Language (informal grammar):
     unary       := ("-"|"!") unary | cast | primary
     cast        := "(" type ")" unary
     primary     := NUMBER | FLOAT | IDENT | IDENT "(" (expr ("," expr)*)? ")"
-                 | "(" expr ")"
+                 | cmd_call | "(" expr ")"
+    cmd_call    := "cmd" "(" STRING ("," expr)* ")"
 
 Notes:
   - Two numeric types: `int` (int32) and `float` (IEEE754 float32) — see
@@ -71,6 +72,25 @@ Floats:
     does NOT auto-narrow — that's a compile error, use an explicit cast.
   - `(float)expr` / `(int)expr` convert explicitly. `(int)` truncates
     toward zero, matching a C cast.
+
+cmd() -- calling into the command processor directly:
+  - `cmd("SADCPIN", pin)` invokes command SADCPIN (with `pin` as its
+    argument) against whatever the embedding project's commandProcessor
+    already exposes -- no per-project syscall needs writing for this. The
+    literal name is stored once in a string-constant pool compiled
+    alongside the code (repeated calls to the same name share one copy);
+    CMDCALL carries a pool offset, not the string itself, so the VM core
+    still touches no strings directly -- see GAACEScript.h.
+  - Returns an int: the response parsed as a number on ACK, 0 on NAK or if
+    the response has no trailing number (e.g. a plain action command with
+    no return value). NAK and "ACK with value 0" are not distinguishable
+    from the return value alone -- check what you're calling if that
+    matters.
+  - Arguments aren't type-checked (same as syscalls) -- floats can be
+    passed, but the receiving command decides how to interpret them.
+  - Compiled output for a script that uses cmd() includes a second
+    artifact (the pool) alongside the code -- see gsc.py's --format
+    handling and tools/README.md.
 
 Output formats: raw binary, ASCII hex, or a C uint8_t array body suitable for
 pasting into firmware source.
@@ -123,6 +143,7 @@ OP_FGT      = 0x23
 OP_FGE      = 0x24
 OP_I2F      = 0x25
 OP_F2I      = 0x26
+OP_CMDCALL  = 0x27
 
 VAR_SLOTS = 16
 
@@ -154,13 +175,14 @@ class CompileError(Exception):
 WHITESPACE_RE = re.compile(r"\s+")
 COMMENT_RE = re.compile(r"//[^\n]*")
 TOKEN_RE = re.compile(r"""
-    (?P<FLOAT>[0-9]+\.[0-9]+)
+    (?P<STRING>"[^"\n]*")
+  | (?P<FLOAT>[0-9]+\.[0-9]+)
   | (?P<NUMBER>0[xX][0-9a-fA-F]+|[0-9]+)
   | (?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)
   | (?P<OP>==|!=|<=|>=|&&|\|\||[(){};,=+\-*/%<>!:])
 """, re.VERBOSE)
 
-KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float"}
+KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float", "cmd"}
 
 
 class Token:
@@ -198,6 +220,8 @@ def tokenize(src):
             tokens.append(Token(text, text, m.start()))
         elif kind == "OP":
             tokens.append(Token(text, text, m.start()))
+        elif kind == "STRING":
+            tokens.append(Token(kind, text[1:-1], m.start()))  # strip quotes
         else:
             tokens.append(Token(kind, text, m.start()))
     tokens.append(Token("EOF", None, n))
@@ -218,6 +242,9 @@ class Cast:
 
 class Call:
     def __init__(self, name, args): self.name, self.args = name, args
+
+class CmdCall:
+    def __init__(self, cmd_name, args): self.cmd_name, self.args = cmd_name, args
 
 class UnOp:
     def __init__(self, op, operand): self.op, self.operand = op, operand
@@ -434,6 +461,16 @@ class Parser:
                 self.expect(")")
                 return Call(t.value, args)
             return Var(t.value)
+        if t.kind == "cmd":
+            self.advance()
+            self.expect("(")
+            name_tok = self.expect("STRING")
+            args = []
+            while self.at(","):
+                self.advance()
+                args.append(self.parse_expr())
+            self.expect(")")
+            return CmdCall(name_tok.value, args)
         if t.kind == "(":
             self.advance()
             e = self.parse_expr()
@@ -454,6 +491,18 @@ class Codegen:
         self.fixups = []          # list of (pos, label)
         self.labels = {}          # label -> address
         self._next_label = 0
+        self.pool = bytearray()   # string constants for cmd(), NUL-terminated
+        self._pool_offsets = {}   # name -> offset already in self.pool (dedup)
+
+    def pool_offset_for(self, name):
+        if name in self._pool_offsets:
+            return self._pool_offsets[name]
+        if len(name.encode("ascii")) != len(name):
+            raise CompileError(f"cmd() name {name!r} must be plain ASCII")
+        offset = len(self.pool)
+        self.pool += name.encode("ascii") + b"\x00"
+        self._pool_offsets[name] = offset
+        return offset
 
     def new_label(self):
         self._next_label += 1
@@ -535,6 +584,8 @@ class Codegen:
             if expr.name not in self.syscalls:
                 raise CompileError(f"call to undeclared syscall '{expr.name}'")
             return self.syscalls[expr.name][2]
+        if isinstance(expr, CmdCall):
+            return "int"
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
     def emit_jump(self, op, label):
@@ -678,10 +729,26 @@ class Codegen:
             self.emit(len(expr.args))
             return return_type
 
+        if isinstance(expr, CmdCall):
+            offset = self.pool_offset_for(expr.cmd_name)
+            if offset > 0xFFFF:
+                raise CompileError("string pool too large (over 65535 bytes)")
+            if len(expr.args) > 0xFF:
+                raise CompileError(f"cmd({expr.cmd_name!r}, ...) has too many arguments")
+            for a in expr.args:
+                self.gen_expr(a)
+            self.emit(OP_CMDCALL)
+            self.buf += offset.to_bytes(2, "little")
+            self.emit(len(expr.args))
+            return "int"
+
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
 
-def compile_source(src):
+def compile_source_with_pool(src):
+    """Returns (code, pool). `pool` is the string-constant table cmd() calls
+    reference (empty bytes if the script never uses cmd()) -- see gsc.py's
+    module docstring and tools/README.md for what to do with it."""
     tokens = tokenize(src)
     decls, program = Parser(tokens).parse_program()
     syscalls = {}
@@ -689,7 +756,14 @@ def compile_source(src):
         if d.name in syscalls:
             raise CompileError(f"syscall '{d.name}' declared more than once")
         syscalls[d.name] = (d.id, len(d.params), d.return_type)
-    return Codegen(syscalls).gen_program(program)
+    codegen = Codegen(syscalls)
+    code = codegen.gen_program(program)
+    return code, bytes(codegen.pool)
+
+
+def compile_source(src):
+    """Back-compat wrapper for callers that only need the code (no cmd())."""
+    return compile_source_with_pool(src)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -705,15 +779,22 @@ _OPNAMES = {
     OP_PUSH_F32: "PUSH_F32", OP_FADD: "FADD", OP_FSUB: "FSUB", OP_FMUL: "FMUL",
     OP_FDIV: "FDIV", OP_FNEG: "FNEG", OP_FEQ: "FEQ", OP_FNE: "FNE",
     OP_FLT: "FLT", OP_FLE: "FLE", OP_FGT: "FGT", OP_FGE: "FGE",
-    OP_I2F: "I2F", OP_F2I: "F2I",
+    OP_I2F: "I2F", OP_F2I: "F2I", OP_CMDCALL: "CMDCALL",
 }
 _OPERAND_LEN = {
     OP_PUSH_I32: 4, OP_PUSH_F32: 4, OP_LOAD: 1, OP_STORE: 1,
-    OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2,
+    OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2, OP_CMDCALL: 3,
 }
 
 
-def disassemble(code: bytes) -> str:
+def _pool_string_at(pool, offset):
+    end = pool.find(b"\x00", offset)
+    if end == -1:
+        return None
+    return pool[offset:end].decode("ascii", errors="replace")
+
+
+def disassemble(code: bytes, pool: bytes = b"") -> str:
     lines = []
     pc = 0
     n = len(code)
@@ -734,6 +815,12 @@ def disassemble(code: bytes) -> str:
             lines.append(f"{pc:4d}: {name} -> {target}")
         elif op == OP_CALL:
             lines.append(f"{pc:4d}: {name} id={code[pc + 1]} argc={code[pc + 2]}")
+        elif op == OP_CMDCALL:
+            offset = int.from_bytes(code[pc + 1:pc + 3], "little")
+            argc = code[pc + 3]
+            name_str = _pool_string_at(pool, offset)
+            label = f'"{name_str}"' if name_str is not None else f"offset={offset}"
+            lines.append(f"{pc:4d}: {name} {label} argc={argc}")
         else:
             lines.append(f"{pc:4d}: {name}")
         pc += 1 + extra
@@ -751,40 +838,70 @@ def main(argv=None):
     ap.add_argument("--format", choices=["bin", "hex", "carray"], default="bin")
     ap.add_argument("--carray-name", default="script", help="identifier for --format carray")
     ap.add_argument("--disasm", action="store_true", help="print disassembly instead of writing output")
+    ap.add_argument("--scriptload", action="store_true",
+                     help="wrap code+pool as [codeLen:u16][code][pool], ready to paste "
+                          "straight into SCRIPTLOAD,<slot>,<hex> (see GAACEScriptRuntime.h). "
+                          "Without this flag, code and pool (if the script uses cmd()) are "
+                          "emitted as-is, matching vmInit()/vmSetPool() called by hand.")
     args = ap.parse_args(argv)
 
     src = sys.stdin.read() if args.source == "-" else open(args.source).read()
 
     try:
-        code = compile_source(src)
+        code, pool = compile_source_with_pool(src)
     except CompileError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
     if args.disasm:
-        print(disassemble(code))
+        print(disassemble(code, pool))
         return 0
 
+    if args.scriptload:
+        payload = len(code).to_bytes(2, "little") + code + pool
+        _emit(payload, args, name_suffix="")
+        return 0
+
+    if pool and args.format in ("bin", "hex"):
+        print(f"warning: this script uses cmd() (pool is {len(pool)} bytes) but "
+              f"--format {args.format} only emits the code; the pool isn't written "
+              f"anywhere. Use --format carray (emits both), or --scriptload (combines "
+              f"them for the SCRIPTLOAD wire format).", file=sys.stderr)
+
+    if args.format == "carray":
+        _emit_carray(code, pool, args)
+    else:
+        _emit(code, args, name_suffix="")
+
+    return 0
+
+
+def _emit(payload, args, name_suffix):
     if args.format == "bin":
         out_path = args.output or (args.source + ".bin" if args.source != "-" else "a.out.bin")
         with open(out_path, "wb") as f:
-            f.write(code)
-    elif args.format == "hex":
-        text = code.hex()
+            f.write(payload)
+    else:  # hex
+        text = payload.hex()
         if args.output:
             open(args.output, "w").write(text + "\n")
         else:
             print(text)
-    else:  # carray
-        body = ", ".join(f"0x{b:02X}" for b in code)
-        text = (f"const uint8_t {args.carray_name}[] = {{ {body} }};\n"
-                f"const uint16_t {args.carray_name}_len = {len(code)};\n")
-        if args.output:
-            open(args.output, "w").write(text)
-        else:
-            print(text, end="")
 
-    return 0
+
+def _emit_carray(code, pool, args):
+    def array_text(name, data):
+        body = ", ".join(f"0x{b:02X}" for b in data)
+        return (f"const uint8_t {name}[] = {{ {body} }};\n"
+                f"const uint16_t {name}_len = {len(data)};\n")
+
+    text = array_text(args.carray_name, code)
+    if pool:
+        text += array_text(f"{args.carray_name}_pool", pool)
+    if args.output:
+        open(args.output, "w").write(text)
+    else:
+        print(text, end="")
 
 
 if __name__ == "__main__":
