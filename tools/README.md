@@ -29,6 +29,10 @@ if (sum > 10) {
 - Types: everything is `int32_t`. No floats, no strings.
 - Variables: plain slots, auto-assigned on first assignment (max 16).
   Reading a variable before it's ever been assigned is a compile error.
+  `var NAME;` reserves a slot without assigning it — for a value meant to
+  persist *across* separate `vmRun()` calls (a periodic script whose caller
+  only resets `pc`/`sp` between ticks, not `vars`), so the script can read
+  it before ever writing it in the current run.
 - `&&` / `||` do **not** short-circuit — both sides always evaluate.
 - Operators: `+ - * / % == != < <= > >= && || !`, and parentheses.
 - A bare call used as a statement (e.g. `print(x);`) discards its return

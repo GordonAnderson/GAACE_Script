@@ -12,6 +12,7 @@ Language (informal grammar):
     program     := (syscall_decl | statement)*
     syscall_decl:= "syscall" IDENT "(" (IDENT ("," IDENT)*)? ")" "=" NUMBER ";"
     statement   := if_stmt | while_stmt | block
+                 | "var" IDENT ";"              (reserve a slot, no assignment)
                  | IDENT "=" expr ";"          (assignment)
                  | expr ";"                     (expression statement)
     if_stmt     := "if" "(" expr ")" block ("else" block)?
@@ -35,7 +36,12 @@ Notes:
     assignment. Reading a variable before it's ever been assigned is a
     compile error (there's no implicit "starts at zero" at the language
     level, even though the VM does zero its slots on vmInit — this catches
-    typos instead of silently running with 0).
+    typos instead of silently running with 0). `var NAME;` reserves a slot
+    without assigning it, for state meant to persist *across* separate
+    vmRun() calls (e.g. a periodic script whose caller resets pc/sp between
+    ticks but deliberately leaves vars alone) — declare it once with `var`,
+    then read/write it normally; what it's seeded with is up to the
+    firmware side.
   - `syscall NAME(params) = ID;` declares a callable that maps to VM opcode
     CALL <ID> <argc-from-declaration>. ID must match the order the embedding
     firmware registers it with vmRegisterSyscall() (0 = first registered).
@@ -103,7 +109,7 @@ TOKEN_RE = re.compile(r"""
   | (?P<OP>==|!=|<=|>=|&&|\|\||[(){};,=+\-*/%<>!])
 """, re.VERBOSE)
 
-KEYWORDS = {"if", "else", "while", "syscall"}
+KEYWORDS = {"if", "else", "while", "syscall", "var"}
 
 
 class Token:
@@ -183,6 +189,9 @@ class Block:
 class SyscallDecl:
     def __init__(self, name, params, id_): self.name, self.params, self.id = name, params, id_
 
+class VarDecl:
+    def __init__(self, name): self.name = name
+
 
 # ---------------------------------------------------------------------------
 # Parser (recursive descent)
@@ -250,6 +259,11 @@ class Parser:
             return self.parse_if()
         if self.at("while"):
             return self.parse_while()
+        if self.at("var"):
+            self.advance()
+            name = self.expect("IDENT").value
+            self.expect(";")
+            return VarDecl(name)
         if self.at("IDENT") and self.tokens[self.i + 1].kind == "=":
             name = self.advance().value
             self.advance()  # '='
@@ -420,6 +434,8 @@ class Codegen:
     def gen_stmt(self, stmt):
         if isinstance(stmt, Block):
             self.gen_block(stmt)
+        elif isinstance(stmt, VarDecl):
+            self.slot_for(stmt.name, declare=True)
         elif isinstance(stmt, Assign):
             self.gen_expr(stmt.expr)
             slot = self.slot_for(stmt.name, declare=True)

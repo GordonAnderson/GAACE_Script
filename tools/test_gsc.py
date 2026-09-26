@@ -33,6 +33,7 @@ HARNESS_CPP = r"""
 using namespace GAACEScript;
 static int32_t sys_print(int32_t *args, uint8_t argc) { printf("%d\n", args[0]); return 0; }
 int main(int argc, char **argv) {
+  int reps = (argc > 2) ? atoi(argv[2]) : 1;
   FILE *f = fopen(argv[1], "rb");
   std::vector<uint8_t> buf; uint8_t b;
   while (fread(&b, 1, 1, f) == 1) buf.push_back(b);
@@ -40,7 +41,11 @@ int main(int argc, char **argv) {
   VM vm;
   vmInit(vm, buf.data(), (uint16_t)buf.size());
   vmRegisterSyscall(vm, sys_print);
-  Status s = vmRun(vm, 10000);
+  Status s = VM_OK;
+  for (int i = 0; i < reps; i++) {
+    vm.pc = 0; vm.sp = 0;   // rerun without vmInit: vars persist across reps
+    s = vmRun(vm, 10000);
+  }
   fprintf(stderr, "STATUS:%d\n", s);
   return 0;
 }
@@ -75,6 +80,10 @@ class StructuralTests(unittest.TestCase):
         with self.assertRaises(gsc.CompileError):
             gsc.compile_source(stmts)
 
+    def test_var_decl_allows_read_before_assignment(self):
+        code = gsc.compile_source("var prev; x = prev + 1;")
+        self.assertIn(gsc.OP_LOAD, code)
+
     def test_disassemble_roundtrip_is_stable(self):
         code = gsc.compile_source("i = 1; while (i <= 3) { i = i + 1; }")
         text = gsc.disassemble(code)
@@ -101,12 +110,12 @@ class EndToEndVmTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
-    def run_script(self, source):
+    def run_script(self, source, reps=1):
         code = gsc.compile_source(source)
         bin_path = os.path.join(self.tmpdir, "prog.bin")
         with open(bin_path, "wb") as f:
             f.write(code)
-        result = subprocess.run([self.harness_bin, bin_path],
+        result = subprocess.run([self.harness_bin, bin_path, str(reps)],
                                  capture_output=True, text=True, check=True)
         status_line = [l for l in result.stderr.splitlines() if l.startswith("STATUS:")][0]
         status = int(status_line.split(":")[1])
@@ -131,6 +140,18 @@ class EndToEndVmTests(unittest.TestCase):
         """)
         self.assertEqual(status, 1)
         self.assertEqual(prints, [100, 200])
+
+    def test_var_persists_across_reruns_without_reinit(self):
+        # Mirrors the intended firmware pattern: vmInit() once, then only
+        # pc/sp reset between ticks so a `var`-declared slot carries state.
+        status, prints = self.run_script("""
+            syscall print(v) = 0;
+            var total;
+            total = total + 1;
+            print(total);
+        """, reps=3)
+        self.assertEqual(status, 1)
+        self.assertEqual(prints, [1, 2, 3])
 
     def test_logical_and_or_not(self):
         status, prints = self.run_script("""
