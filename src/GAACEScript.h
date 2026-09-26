@@ -66,9 +66,23 @@ enum Status : uint8_t {
                            // whether that's an error or expected (see below)
 };
 
-static const uint8_t STACK_SIZE   = 32;
-static const uint8_t VAR_SLOTS    = 16;
-static const uint8_t MAX_SYSCALLS = 32;
+// Overridable per project (e.g. -D GAACE_SCRIPT_STACK_SIZE=64 in
+// platformio.ini) so a resource-rich board can run bigger/more complex
+// scripts than a tight one, without forking the VM. Defaults match the
+// original fixed values.
+#if !defined(GAACE_SCRIPT_STACK_SIZE)
+#define GAACE_SCRIPT_STACK_SIZE 32
+#endif
+#if !defined(GAACE_SCRIPT_VAR_SLOTS)
+#define GAACE_SCRIPT_VAR_SLOTS 16
+#endif
+#if !defined(GAACE_SCRIPT_MAX_SYSCALLS)
+#define GAACE_SCRIPT_MAX_SYSCALLS 32
+#endif
+
+static const uint8_t STACK_SIZE   = GAACE_SCRIPT_STACK_SIZE;
+static const uint8_t VAR_SLOTS    = GAACE_SCRIPT_VAR_SLOTS;
+static const uint8_t MAX_SYSCALLS = GAACE_SCRIPT_MAX_SYSCALLS;
 
 // A syscall receives its arguments in evaluation order (args[0] is the first
 // argument pushed) and returns one int32_t that gets pushed back.

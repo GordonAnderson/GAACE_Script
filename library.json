@@ -19,5 +19,9 @@
   "platforms": "*",
   "build": {
     "srcDir": "src"
+  },
+  "dependencies": {
+    "GAACE_Core": "https://github.com/GordonAnderson/GAACE_Core.git",
+    "ArduinoThread": "https://github.com/GordonAnderson/ArduinoThread.git"
   }
 }

@@ -1,26 +1,44 @@
 /*
-    BasicScript example — GAACE_Script VM
+    BasicScript example — GAACE_Script VM + standard runtime
 
     Demonstrates:
       1. Hand-assembling a small bytecode program with a bounded loop and
          an if/else branch (a real host-side compiler would generate this
          from readable script source instead)
       2. Registering a syscall so the script can call back into firmware code
-      3. Running the script from setup() and printing the result
+      3. Loading it into slot 0 of the standard ScriptRuntime (the same path
+         a project takes to preload a default script at boot) instead of
+         driving a bare VM directly
+      4. Wiring ScriptRuntime's commands (SCRIPTLOAD, GSCRIPTLIMITS,
+         GSCRIPTST) into a commandProcessor over Serial — start/stop/rate
+         for the slot come from GAACE_Core's threadCommands (?TENA,Script0
+         / ?TINT,Script0), not from anything in this library, once
+         GAACE_THREAD_CMDS is also enabled by the consuming project
 
-    Program computed:
+    Program computed (in slot 0, ticking once a second):
       sum = 0; i = 1;
       while (i <= 5) { sum = sum + i; i = i + 1; }   // sum = 15
       print(sum);
       print((sum > 10) ? 100 : 200);                  // 100
 
     Hardware: any board — this example only uses Serial, no other pins.
+    Try it: open a serial monitor at 115200 baud, watch slot 0 print its
+    result once a second, and type GSCRIPTLIMITS or GSCRIPTST,0 to see the
+    new standard commands respond.
 */
 
 #include <Arduino.h>
 #include <GAACEScript.h>
+#include <GAACEScriptRuntime.h>
+#include <commandProcessor.h>
+#include <ThreadController.h>
+#include <string.h>
 
 using namespace GAACEScript;
+
+commandProcessor  cp;
+ThreadController  control;
+ScriptRuntime      scripts(&cp, &control, /*defaultIntervalMs=*/1000);
 
 // ---------------------------------------------------------------------------
 // A tiny hand-assembler for this example. A real host-side compiler would
@@ -65,7 +83,6 @@ static int32_t sys_print(int32_t *args, uint8_t argc) {
   return 0;
 }
 
-static VM vm;
 static Asm program;
 
 static void buildProgram() {
@@ -120,17 +137,23 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
 
+  cp.registerStream(&Serial);
+  cp.registerCommands(scripts.scriptCmdList());
+  scripts.registerSyscall(sys_print);  // id 0, on every slot
+
   buildProgram();
+  ScriptSlot &slot0 = scripts.slots[0];
+  memcpy(slot0.code, program.buf, program.len);
+  slot0.codeLen = program.len;
+  vmInit(slot0.vm, slot0.code, slot0.codeLen);
+  slot0.loaded = true;
 
-  vmInit(vm, program.buf, program.len);
-  vmRegisterSyscall(vm, sys_print);
-
-  Status s = vmRun(vm, 1000);
-  Serial.print("vmRun status: ");
-  Serial.println(s);
+  Serial.println("GAACE_Script BasicScript example ready.");
+  Serial.println("Slot 0 runs once a second; try GSCRIPTLIMITS or GSCRIPTST,0.");
 }
 
 void loop() {
-  // Nothing to do — the script ran once in setup(). A real integration
-  // would call vmRun() from a Thread callback the way ADCThread does today.
+  cp.processStreams();
+  cp.processCommands();
+  control.run();  // drives all SCRIPT_SLOTS threads, including slot 0 above
 }
