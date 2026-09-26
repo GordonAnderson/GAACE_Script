@@ -105,6 +105,17 @@ python3 gsc.py program.gs --scriptload --format hex    # [codeLen][code][pool] c
                                                         # SCRIPTLOAD,<slot>,<hex>
 python3 gsc.py program.gs --disasm                     # print disassembly (shows cmd()
                                                         # names resolved from the pool)
+python3 gsc.py program.gs --upload /dev/ttyUSB0 --slot 1
+                                                        # compile AND send it: builds the
+                                                        # --scriptload payload and sends
+                                                        # SCRIPTLOAD,1,<hex> to that serial
+                                                        # port itself, printing ACK/NAK.
+                                                        # Requires pyserial (pip install
+                                                        # pyserial). --baud (default 115200)
+                                                        # and --timeout (default 3.0s) tune
+                                                        # the connection; --disasm can be
+                                                        # combined with --upload to preview
+                                                        # what's being sent. See WORKFLOW.md.
 ```
 
 ## Tests

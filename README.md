@@ -202,6 +202,7 @@ on an Adafruit QT Py M0, not just against a fake bridge.
 Integrated into [USBrepeater](https://github.com/GordonAnderson/USBrepeater)
 as a real (if still demo-scoped) feature — see its `TODO.md` for what's
 still open there (script persistence across reboot, a boot-notification
-primitive, real-hardware validation of that specific integration). License
-is still an open decision (placeholder `MIT` in `library.json`),
-intentionally not settled yet.
+primitive, real-hardware validation of that specific integration). See
+this repo's own [TODO.md](TODO.md) for what's open here specifically
+(license, `stm32` parity, known `cmd()` limitations, deferred host-app
+integration).

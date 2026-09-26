@@ -26,31 +26,39 @@ if (watts > 100.0) {
 }
 ```
 
-## 2. Compile it to the wire format
+## 2. Compile it and send it
 
 ```
-python3 tools/gsc.py drive_limit.gs --scriptload --format hex
+python3 tools/gsc.py drive_limit.gs --upload /dev/ttyUSB0 --slot 1
 ```
 
-This prints one hex string: the code and string-constant pool combined
-with the `[codeLen][code][pool]` length prefix `SCRIPTLOAD` expects. Sanity
-check it first with `--disasm` if you want to see the actual opcodes before
-sending anything to a real device.
-
-## 3. Send it to the controller
-
-Open a serial connection to the control port (e.g. `SerialUSB1` at 115200
-baud) with whatever terminal you already use for GAACE commands, pick a
-free slot, and send:
+Compiles, opens that serial port itself, sends `SCRIPTLOAD,1,<hex>` (the
+code and string-constant pool combined with the `[codeLen][code][pool]`
+length prefix `SCRIPTLOAD` expects), and prints the result:
 
 ```
-SCRIPTLOAD,1,<the hex string>
+OK: script loaded into slot 1 (12 bytes)
 ```
 
-You get back `ACK` or `NAK`, same as any other command. Nothing here
-requires a firmware rebuild or reflash.
+or, on failure:
 
-## 4. Confirm it loaded
+```
+NAK: device rejected the script (bad slot, malformed hex, or over
+the configured size limit -- see GSCRIPTLIMITS)
+```
+
+Requires `pyserial` (`pip install pyserial`). `--baud` (default 115200) and
+`--timeout` (default 3.0s) tune the connection if needed. Add `--disasm` to
+preview the actual opcodes before they're sent. Nothing here requires a
+firmware rebuild or reflash.
+
+**Without `--upload`** — e.g. compiling on one machine and sending from
+another, or wanting to inspect the exact bytes first — split it into two
+steps: `python3 tools/gsc.py drive_limit.gs --scriptload --format hex`
+prints the same hex string without sending anything, for pasting into
+whatever serial terminal you already use for GAACE commands.
+
+## 3. Confirm it loaded
 
 ```
 GSCRIPTST,1
@@ -58,7 +66,7 @@ GSCRIPTST,1
 
 → `1,0` (loaded=1, lastStatus=0/`VM_OK` — hasn't run yet).
 
-## 5. Turn it on
+## 4. Turn it on
 
 Loading doesn't start it running — a fresh load shouldn't immediately start
 firing before you're ready. Enable and set its rate with GAACE_Core's
@@ -69,11 +77,11 @@ STENA,Script1,TRUE
 STINT,Script1,1000
 ```
 
-## 6. Iterate
+## 5. Iterate
 
-Edit the `.gs` file, recompile, send a new `SCRIPTLOAD,1,<hex>` — it
-overwrites the slot. `GSCRIPTST,1` again to watch `lastStatus` change as it
-runs. No firmware rebuild anywhere in this loop.
+Edit the `.gs` file, re-run the same `gsc.py --upload ... --slot 1` command
+— it overwrites the slot. `GSCRIPTST,1` again to watch `lastStatus` change
+as it runs. No firmware rebuild anywhere in this loop.
 
 To stop it: `STENA,Script1,FALSE`. To check the slot/size budget before
 writing something ambitious: `GSCRIPTLIMITS`.
@@ -90,12 +98,12 @@ today, a `SCRIPTLOAD`-loaded script does **not** survive a reboot (see
 
 ## Current gaps
 
-- **No upload tool yet.** Step 3 above means manually pasting a command
-  into a serial terminal. Teaching `gsc.py` (or a small sibling script) to
-  open the port and send the line itself is the natural next step — see
-  the repo's recent design discussion for why that's preferred over
-  integrating compile+download into a larger host application right now.
 - **Per-project dependency freshness.** A project has to actually pull the
-  `GAACE_Script` commit that has `cmd()`/floats/etc. for any of this to
-  work — check its `platformio.ini` `lib_deps` (or force a refresh) if a
-  feature described here doesn't seem to exist.
+  `GAACE_Script` commit that has `cmd()`/floats/`--upload`/etc. for any of
+  this to work — check its `platformio.ini` `lib_deps` (or force a refresh)
+  if a feature described here doesn't seem to exist.
+- **No GUI for any of this.** `--upload` replaces the manual-paste step
+  with one command, but it's still a command line, not a control-panel
+  button. See [TODO.md](TODO.md) for why a full host-application
+  integration (edit/compile/download inside a larger GUI) is deliberately
+  not being pursued yet.

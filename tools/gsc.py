@@ -93,13 +93,15 @@ cmd() -- calling into the command processor directly:
     handling and tools/README.md.
 
 Output formats: raw binary, ASCII hex, or a C uint8_t array body suitable for
-pasting into firmware source.
+pasting into firmware source. --upload sends the compiled script straight to
+a running controller's control port via SCRIPTLOAD (see WORKFLOW.md).
 """
 
 import argparse
 import re
 import struct
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # Opcodes — MUST stay numerically in sync with the enum in src/GAACEScript.h.
@@ -766,6 +768,12 @@ def compile_source(src):
     return compile_source_with_pool(src)[0]
 
 
+def build_scriptload_payload(code, pool):
+    """[codeLen:u16 LE][code][pool] -- the wire format SCRIPTLOAD expects.
+    Shared by --scriptload (file output) and --upload (sends it directly)."""
+    return len(code).to_bytes(2, "little") + code + pool
+
+
 # ---------------------------------------------------------------------------
 # Disassembler (debugging aid)
 # ---------------------------------------------------------------------------
@@ -843,6 +851,16 @@ def main(argv=None):
                           "straight into SCRIPTLOAD,<slot>,<hex> (see GAACEScriptRuntime.h). "
                           "Without this flag, code and pool (if the script uses cmd()) are "
                           "emitted as-is, matching vmInit()/vmSetPool() called by hand.")
+    ap.add_argument("--upload", metavar="PORT",
+                     help="compile and send straight to a running controller's control port "
+                          "via SCRIPTLOAD,<slot>,<hex> (e.g. --upload /dev/ttyUSB0 or "
+                          "--upload COM5). Requires --slot and pyserial (pip install pyserial). "
+                          "Implies the same wire format as --scriptload; --format/-o are "
+                          "ignored.")
+    ap.add_argument("--slot", type=int, metavar="N", help="script slot for --upload")
+    ap.add_argument("--baud", type=int, default=115200, help="baud rate for --upload (default 115200)")
+    ap.add_argument("--timeout", type=float, default=3.0,
+                     help="seconds to wait for ACK/NAK from --upload (default 3.0)")
     args = ap.parse_args(argv)
 
     src = sys.stdin.read() if args.source == "-" else open(args.source).read()
@@ -855,10 +873,19 @@ def main(argv=None):
 
     if args.disasm:
         print(disassemble(code, pool))
-        return 0
+        if not args.upload:
+            return 0
+
+    if args.upload:
+        if args.slot is None:
+            print("error: --upload requires --slot", file=sys.stderr)
+            return 1
+        payload = build_scriptload_payload(code, pool)
+        return upload_script(args.upload, args.slot, payload.hex(),
+                              baud=args.baud, timeout=args.timeout)
 
     if args.scriptload:
-        payload = len(code).to_bytes(2, "little") + code + pool
+        payload = build_scriptload_payload(code, pool)
         _emit(payload, args, name_suffix="")
         return 0
 
@@ -874,6 +901,49 @@ def main(argv=None):
         _emit(code, args, name_suffix="")
 
     return 0
+
+
+def upload_script(port, slot, payload_hex, baud=115200, timeout=3.0):
+    """Sends SCRIPTLOAD,<slot>,<payload_hex> to `port` and reports ACK/NAK.
+
+    Opens the port, sends the line, and reads back whatever the device
+    writes within `timeout` seconds -- ACK (0x06) means the load succeeded,
+    NAK (0x15) means the device rejected it (bad slot, malformed hex, or
+    over its configured size limit). Returns a process exit code (0 on
+    ACK, 1 otherwise) so this composes with shell scripting.
+    """
+    try:
+        import serial
+    except ImportError:
+        print("error: --upload requires pyserial -- pip install pyserial", file=sys.stderr)
+        return 1
+
+    line = f"SCRIPTLOAD,{slot},{payload_hex}\n"
+
+    try:
+        with serial.Serial(port, baud, timeout=timeout) as ser:
+            time.sleep(0.2)  # let the connection settle before writing
+            ser.reset_input_buffer()
+            ser.write(line.encode("ascii"))
+            response = ser.read(256)
+    except serial.SerialException as e:
+        print(f"error: could not open {port}: {e}", file=sys.stderr)
+        return 1
+
+    if not response:
+        print(f"error: no response from device within {timeout}s "
+              f"(wrong port/baud, or the control port isn't the one you opened?)",
+              file=sys.stderr)
+        return 1
+    if response[0] == 0x06:
+        print(f"OK: script loaded into slot {slot} ({len(payload_hex) // 2} bytes)")
+        return 0
+    if response[0] == 0x15:
+        print(f"NAK: device rejected the script (bad slot, malformed hex, or over "
+              f"the configured size limit -- see GSCRIPTLIMITS)", file=sys.stderr)
+        return 1
+    print(f"warning: unexpected response from device: {response!r}", file=sys.stderr)
+    return 1
 
 
 def _emit(payload, args, name_suffix):
