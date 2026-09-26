@@ -24,7 +24,12 @@ library from day one rather than a one-off inside a single project.
 - **A VM instance is a fixed-size struct** — a 32-entry operand stack, 16
   variable slots, a program counter. No dynamic allocation anywhere. Total
   footprint is well under 1 KB.
-- **~20 opcodes.** `if`/`while`-style control flow isn't built in — a
+- **~30 opcodes, two numeric types.** `int` (int32) and `float` (IEEE754
+  float32) — a stack/variable slot is just 4 bytes with no type tag
+  anywhere; it's the opcode (`ADD` vs `FADD`, `LT` vs `FLT`, ...) that
+  carries the type, decided by the compiler, not tracked at runtime. See
+  [tools/README.md](tools/README.md) for the language's promotion/cast
+  rules. `if`/`while`-style control flow isn't built in either — the
   host-side compiler lowers it to plain conditional/unconditional jumps,
   the same way any real compiler handles control flow:
 

@@ -1,4 +1,5 @@
 #include "GAACEScript.h"
+#include <string.h>  // memcpy() for int32<->float32 bit reinterpretation
 
 namespace GAACEScript {
 
@@ -9,6 +10,21 @@ static inline int32_t readI32(const uint8_t *p) {
 
 static inline uint16_t readU16(const uint8_t *p) {
   return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+// memcpy-based bit reinterpretation avoids strict-aliasing UB (unlike a
+// pointer cast) and compiles down to a no-op register move on every target
+// this library runs on (both types are 4 bytes).
+static inline float asFloat(int32_t bits) {
+  float f;
+  memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+static inline int32_t asBits(float f) {
+  int32_t bits;
+  memcpy(&bits, &f, sizeof(bits));
+  return bits;
 }
 
 static inline Status push(VM &vm, int32_t v) {
@@ -150,6 +166,81 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
         } else {
           vm.pc += 3;
         }
+        break;
+      }
+
+      case OP_PUSH_F32: {
+        // Same mechanics as OP_PUSH_I32 -- readI32 just gets the 4 raw
+        // bytes; asFloat() below is what actually makes them a float.
+        if ((uint32_t)vm.pc + 5 > vm.codeLen) return VM_ERR_BAD_JUMP;
+        int32_t bits = readI32(&vm.code[vm.pc + 1]);
+        Status s = push(vm, bits);
+        if (s != VM_OK) return s;
+        vm.pc += 5;
+        break;
+      }
+
+      case OP_FADD: case OP_FSUB: case OP_FMUL: case OP_FDIV:
+      case OP_FEQ:  case OP_FNE:  case OP_FLT:  case OP_FLE:
+      case OP_FGT:  case OP_FGE: {
+        int32_t aBits, bBits;
+        Status s = pop(vm, bBits);
+        if (s != VM_OK) return s;
+        s = pop(vm, aBits);
+        if (s != VM_OK) return s;
+        float a = asFloat(aBits), b = asFloat(bBits);
+        int32_t r = 0;
+        switch (op) {
+          case OP_FADD: r = asBits(a + b); break;
+          case OP_FSUB: r = asBits(a - b); break;
+          case OP_FMUL: r = asBits(a * b); break;
+          case OP_FDIV:
+            // Consistent with integer DIV: an error, not IEEE inf/nan --
+            // one "division by zero is always an error" rule for the whole
+            // VM, rather than type-dependent semantics.
+            if (b == 0.0f) return VM_ERR_DIV_ZERO;
+            r = asBits(a / b);
+            break;
+          case OP_FEQ: r = (a == b); break;
+          case OP_FNE: r = (a != b); break;
+          case OP_FLT: r = (a < b);  break;
+          case OP_FLE: r = (a <= b); break;
+          case OP_FGT: r = (a > b);  break;
+          case OP_FGE: r = (a >= b); break;
+        }
+        s = push(vm, r);
+        if (s != VM_OK) return s;
+        vm.pc += 1;
+        break;
+      }
+
+      case OP_FNEG: {
+        int32_t aBits;
+        Status s = pop(vm, aBits);
+        if (s != VM_OK) return s;
+        s = push(vm, asBits(-asFloat(aBits)));
+        if (s != VM_OK) return s;
+        vm.pc += 1;
+        break;
+      }
+
+      case OP_I2F: {
+        int32_t a;
+        Status s = pop(vm, a);
+        if (s != VM_OK) return s;
+        s = push(vm, asBits((float)a));
+        if (s != VM_OK) return s;
+        vm.pc += 1;
+        break;
+      }
+
+      case OP_F2I: {
+        int32_t aBits;
+        Status s = pop(vm, aBits);
+        if (s != VM_OK) return s;
+        s = push(vm, (int32_t)asFloat(aBits));  // truncates toward zero
+        if (s != VM_OK) return s;
+        vm.pc += 1;
         break;
       }
 

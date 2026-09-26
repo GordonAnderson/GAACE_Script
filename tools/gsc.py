@@ -10,11 +10,13 @@ this compiler.
 Language (informal grammar):
 
     program     := (syscall_decl | statement)*
-    syscall_decl:= "syscall" IDENT "(" (IDENT ("," IDENT)*)? ")" "=" NUMBER ";"
+    syscall_decl:= "syscall" IDENT "(" (IDENT ("," IDENT)*)? ")"
+                   (":" type)? "=" NUMBER ";"
     statement   := if_stmt | while_stmt | block
-                 | "var" IDENT ";"              (reserve a slot, no assignment)
+                 | "var" IDENT (":" type)? ";"  (reserve a slot, no assignment)
                  | IDENT "=" expr ";"          (assignment)
                  | expr ";"                     (expression statement)
+    type        := "int" | "float"
     if_stmt     := "if" "(" expr ")" block ("else" block)?
     while_stmt  := "while" "(" expr ")" block
     block       := "{" statement* "}"
@@ -24,29 +26,51 @@ Language (informal grammar):
     cmp_expr    := add_expr (("=="|"!="|"<"|"<="|">"|">=") add_expr)*
     add_expr    := mul_expr (("+"|"-") mul_expr)*
     mul_expr    := unary (("*"|"/"|"%") unary)*
-    unary       := ("-"|"!") unary | primary
-    primary     := NUMBER | IDENT | IDENT "(" (expr ("," expr)*)? ")"
+    unary       := ("-"|"!") unary | cast | primary
+    cast        := "(" type ")" unary
+    primary     := NUMBER | FLOAT | IDENT | IDENT "(" (expr ("," expr)*)? ")"
                  | "(" expr ")"
 
 Notes:
+  - Two numeric types: `int` (int32) and `float` (IEEE754 float32) — see
+    "Floats" below. Everything else about the language is untyped text; the
+    type system exists only to pick the right opcode (ADD vs FADD, etc.),
+    there's no other static checking.
   - `&&` / `||` are NOT short-circuiting — both operands are always evaluated
     (the VM's AND/OR opcodes just combine two already-computed values). Don't
-    rely on short-circuit side effects the way you might in C.
-  - Variables are plain int32 slots, auto-allocated in order of first
-    assignment. Reading a variable before it's ever been assigned is a
-    compile error (there's no implicit "starts at zero" at the language
-    level, even though the VM does zero its slots on vmInit — this catches
-    typos instead of silently running with 0). `var NAME;` reserves a slot
-    without assigning it, for state meant to persist *across* separate
-    vmRun() calls (e.g. a periodic script whose caller resets pc/sp between
-    ticks but deliberately leaves vars alone) — declare it once with `var`,
-    then read/write it normally; what it's seeded with is up to the
+    rely on short-circuit side effects the way you might in C. Both require
+    int-typed operands (comparisons already produce int, so `a > b && c > d`
+    works fine either way).
+  - Variables are plain 32-bit slots, auto-allocated in order of first
+    assignment, with their type inferred from that first assignment (there's
+    no implicit "starts at zero" at the language level, even though the VM
+    does zero its slots on vmInit — this catches typos instead of silently
+    running with 0). `var NAME;` / `var NAME: float;` reserves a slot without
+    assigning it (default type `int` if omitted), for state meant to persist
+    *across* separate vmRun() calls (e.g. a periodic script whose caller
+    resets pc/sp between ticks but deliberately leaves vars alone) — declare
+    it once, then read/write it normally; what it's seeded with is up to the
     firmware side.
   - `syscall NAME(params) = ID;` declares a callable that maps to VM opcode
     CALL <ID> <argc-from-declaration>. ID must match the order the embedding
     firmware registers it with vmRegisterSyscall() (0 = first registered).
+    Add `: float` before the `=` if the syscall's C++ implementation returns
+    a float (bit-cast into the same int32_t return type — see
+    GAACEScript.h); omitted means `int`.
   - An expression used as a statement (e.g. a bare call for its side effect)
     has its return value discarded (compiled as <expr> POP).
+
+Floats:
+  - Literals need a decimal point (`3.5`, `0.0`) — `3` is always `int`.
+  - `+ - * /` promote automatically: int paired with float produces float
+    (an implicit int-to-float conversion is inserted for the int operand).
+    `%` (MOD) has no float form — mixing it with a float operand is a
+    compile error.
+  - Assigning an int-typed expression to a float-typed variable auto-
+    promotes; assigning a float-typed expression to an int-typed variable
+    does NOT auto-narrow — that's a compile error, use an explicit cast.
+  - `(float)expr` / `(int)expr` convert explicitly. `(int)` truncates
+    toward zero, matching a C cast.
 
 Output formats: raw binary, ASCII hex, or a C uint8_t array body suitable for
 pasting into firmware source.
@@ -54,6 +78,7 @@ pasting into firmware source.
 
 import argparse
 import re
+import struct
 import sys
 
 # ---------------------------------------------------------------------------
@@ -84,6 +109,20 @@ OP_JMP      = 0x15
 OP_JZ       = 0x16
 OP_JNZ      = 0x17
 OP_CALL     = 0x18
+OP_PUSH_F32 = 0x19
+OP_FADD     = 0x1A
+OP_FSUB     = 0x1B
+OP_FMUL     = 0x1C
+OP_FDIV     = 0x1D
+OP_FNEG     = 0x1E
+OP_FEQ      = 0x1F
+OP_FNE      = 0x20
+OP_FLT      = 0x21
+OP_FLE      = 0x22
+OP_FGT      = 0x23
+OP_FGE      = 0x24
+OP_I2F      = 0x25
+OP_F2I      = 0x26
 
 VAR_SLOTS = 16
 
@@ -92,6 +131,17 @@ BINOP_OPCODE = {
     "==": OP_EQ, "!=": OP_NE, "<": OP_LT, "<=": OP_LE, ">": OP_GT, ">=": OP_GE,
     "&&": OP_AND, "||": OP_OR,
 }
+
+# Float variants for the numeric/comparison ops (no float form of MOD, AND, OR).
+BINOP_OPCODE_F = {
+    "+": OP_FADD, "-": OP_FSUB, "*": OP_FMUL, "/": OP_FDIV,
+    "==": OP_FEQ, "!=": OP_FNE, "<": OP_FLT, "<=": OP_FLE, ">": OP_FGT, ">=": OP_FGE,
+}
+
+# Ops whose result is always `int` regardless of operand type (comparisons
+# and logic), vs. ops that preserve the operand type (arithmetic).
+COMPARISON_OPS = {"==", "!=", "<", "<=", ">", ">="}
+LOGIC_OPS = {"&&", "||"}
 
 
 class CompileError(Exception):
@@ -104,12 +154,13 @@ class CompileError(Exception):
 WHITESPACE_RE = re.compile(r"\s+")
 COMMENT_RE = re.compile(r"//[^\n]*")
 TOKEN_RE = re.compile(r"""
-    (?P<NUMBER>0[xX][0-9a-fA-F]+|[0-9]+)
+    (?P<FLOAT>[0-9]+\.[0-9]+)
+  | (?P<NUMBER>0[xX][0-9a-fA-F]+|[0-9]+)
   | (?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)
-  | (?P<OP>==|!=|<=|>=|&&|\|\||[(){};,=+\-*/%<>!])
+  | (?P<OP>==|!=|<=|>=|&&|\|\||[(){};,=+\-*/%<>!:])
 """, re.VERBOSE)
 
-KEYWORDS = {"if", "else", "while", "syscall", "var"}
+KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float"}
 
 
 class Token:
@@ -157,10 +208,13 @@ def tokenize(src):
 # AST
 # ---------------------------------------------------------------------------
 class Num:
-    def __init__(self, value): self.value = value
+    def __init__(self, value, is_float=False): self.value, self.is_float = value, is_float
 
 class Var:
     def __init__(self, name): self.name = name
+
+class Cast:
+    def __init__(self, target_type, expr): self.target_type, self.expr = target_type, expr
 
 class Call:
     def __init__(self, name, args): self.name, self.args = name, args
@@ -187,10 +241,11 @@ class Block:
     def __init__(self, stmts): self.stmts = stmts
 
 class SyscallDecl:
-    def __init__(self, name, params, id_): self.name, self.params, self.id = name, params, id_
+    def __init__(self, name, params, id_, return_type="int"):
+        self.name, self.params, self.id, self.return_type = name, params, id_, return_type
 
 class VarDecl:
-    def __init__(self, name): self.name = name
+    def __init__(self, name, var_type="int"): self.name, self.var_type = name, var_type
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +283,12 @@ class Parser:
                 stmts.append(self.parse_statement())
         return decls, Block(stmts)
 
+    def parse_type(self):
+        if self.at("int") or self.at("float"):
+            return self.advance().kind
+        t = self.peek()
+        raise CompileError(f"expected a type ('int' or 'float') but found {t.kind!r} at offset {t.pos}")
+
     def parse_syscall_decl(self):
         self.expect("syscall")
         name = self.expect("IDENT").value
@@ -239,10 +300,14 @@ class Parser:
                 self.advance()
                 params.append(self.expect("IDENT").value)
         self.expect(")")
+        return_type = "int"
+        if self.at(":"):
+            self.advance()
+            return_type = self.parse_type()
         self.expect("=")
         id_tok = self.expect("NUMBER")
         self.expect(";")
-        return SyscallDecl(name, params, int(id_tok.value, 0))
+        return SyscallDecl(name, params, int(id_tok.value, 0), return_type)
 
     def parse_block(self):
         self.expect("{")
@@ -262,8 +327,12 @@ class Parser:
         if self.at("var"):
             self.advance()
             name = self.expect("IDENT").value
+            var_type = "int"
+            if self.at(":"):
+                self.advance()
+                var_type = self.parse_type()
             self.expect(";")
-            return VarDecl(name)
+            return VarDecl(name, var_type)
         if self.at("IDENT") and self.tokens[self.i + 1].kind == "=":
             name = self.advance().value
             self.advance()  # '='
@@ -336,13 +405,22 @@ class Parser:
         if self.peek().kind in ("-", "!"):
             op = self.advance().kind
             return UnOp(op, self.parse_unary())
+        if (self.at("(") and self.tokens[self.i + 1].kind in ("int", "float")
+                and self.tokens[self.i + 2].kind == ")"):
+            self.advance()  # '('
+            target_type = self.parse_type()
+            self.advance()  # ')'
+            return Cast(target_type, self.parse_unary())
         return self.parse_primary()
 
     def parse_primary(self):
         t = self.peek()
         if t.kind == "NUMBER":
             self.advance()
-            return Num(int(t.value, 0))
+            return Num(int(t.value, 0), is_float=False)
+        if t.kind == "FLOAT":
+            self.advance()
+            return Num(float(t.value), is_float=True)
         if t.kind == "IDENT":
             self.advance()
             if self.at("("):
@@ -369,9 +447,10 @@ class Parser:
 # ---------------------------------------------------------------------------
 class Codegen:
     def __init__(self, syscalls):
-        self.syscalls = syscalls  # name -> (id, argc)
+        self.syscalls = syscalls  # name -> (id, argc, return_type)
         self.buf = bytearray()
         self.vars = {}            # name -> slot
+        self.var_types = {}       # name -> "int" | "float"
         self.fixups = []          # list of (pos, label)
         self.labels = {}          # label -> address
         self._next_label = 0
@@ -383,7 +462,7 @@ class Codegen:
     def mark_label(self, label):
         self.labels[label] = len(self.buf)
 
-    def slot_for(self, name, declare=False):
+    def slot_for(self, name, declare=False, var_type=None):
         if name in self.vars:
             return self.vars[name]
         if not declare:
@@ -392,6 +471,7 @@ class Codegen:
             raise CompileError(f"too many variables (max {VAR_SLOTS})")
         slot = len(self.vars)
         self.vars[name] = slot
+        self.var_types[name] = var_type or "int"
         return slot
 
     def emit(self, byte):
@@ -409,6 +489,53 @@ class Codegen:
     def emit_push(self, value):
         self.emit(OP_PUSH_I32)
         self.buf += int(value).to_bytes(4, "little", signed=True)
+
+    def emit_push_f32(self, value):
+        self.emit(OP_PUSH_F32)
+        self.buf += struct.pack("<f", value)
+
+    def emit_convert(self, from_type, to_type):
+        if from_type == to_type:
+            return
+        if from_type == "int" and to_type == "float":
+            self.emit(OP_I2F)
+        elif from_type == "float" and to_type == "int":
+            self.emit(OP_F2I)
+        else:
+            raise CompileError(f"internal error: bad conversion {from_type} -> {to_type}")
+
+    def infer_type(self, expr):
+        """Type of `expr` without emitting anything -- used to decide, e.g.,
+        whether a binary op's operands need promoting, before the left
+        operand (already emitted) can be converted in place."""
+        if isinstance(expr, Num):
+            return "float" if expr.is_float else "int"
+        if isinstance(expr, Var):
+            if expr.name not in self.var_types:
+                raise CompileError(f"variable '{expr.name}' used before assignment")
+            return self.var_types[expr.name]
+        if isinstance(expr, Cast):
+            return expr.target_type
+        if isinstance(expr, UnOp):
+            if expr.op == "!":
+                if self.infer_type(expr.operand) != "int":
+                    raise CompileError("'!' requires an int operand")
+                return "int"
+            return self.infer_type(expr.operand)  # '-' preserves type
+        if isinstance(expr, BinOp):
+            if expr.op in LOGIC_OPS or expr.op in COMPARISON_OPS:
+                return "int"
+            lt = self.infer_type(expr.left)
+            rt = self.infer_type(expr.right)
+            common = "float" if (lt == "float" or rt == "float") else "int"
+            if expr.op == "%" and common == "float":
+                raise CompileError("'%' has no float form")
+            return common
+        if isinstance(expr, Call):
+            if expr.name not in self.syscalls:
+                raise CompileError(f"call to undeclared syscall '{expr.name}'")
+            return self.syscalls[expr.name][2]
+        raise CompileError(f"internal error: unknown expression {expr!r}")
 
     def emit_jump(self, op, label):
         self.emit(op)
@@ -435,10 +562,21 @@ class Codegen:
         if isinstance(stmt, Block):
             self.gen_block(stmt)
         elif isinstance(stmt, VarDecl):
-            self.slot_for(stmt.name, declare=True)
+            self.slot_for(stmt.name, declare=True, var_type=stmt.var_type)
         elif isinstance(stmt, Assign):
-            self.gen_expr(stmt.expr)
-            slot = self.slot_for(stmt.name, declare=True)
+            expr_type = self.gen_expr(stmt.expr)
+            if stmt.name in self.vars:
+                var_type = self.var_types[stmt.name]
+                if expr_type != var_type:
+                    if expr_type == "int" and var_type == "float":
+                        self.emit_convert("int", "float")
+                    else:
+                        raise CompileError(
+                            f"cannot assign a {expr_type} expression to {var_type} "
+                            f"variable '{stmt.name}' -- use an explicit (int)/(float) cast")
+                slot = self.vars[stmt.name]
+            else:
+                slot = self.slot_for(stmt.name, declare=True, var_type=expr_type)
             self.emit(OP_STORE)
             self.emit(slot)
         elif isinstance(stmt, ExprStmt):
@@ -468,23 +606,68 @@ class Codegen:
             raise CompileError(f"internal error: unknown statement {stmt!r}")
 
     def gen_expr(self, expr):
+        """Emits code to evaluate `expr`, leaving one value on the stack.
+        Returns the type ("int" or "float") of that value."""
         if isinstance(expr, Num):
+            if expr.is_float:
+                self.emit_push_f32(expr.value)
+                return "float"
             self.emit_push(expr.value)
-        elif isinstance(expr, Var):
-            slot = self.slot_for(expr.name)
+            return "int"
+
+        if isinstance(expr, Var):
+            t = self.infer_type(expr)  # also raises "used before assignment"
+            slot = self.vars[expr.name]
             self.emit(OP_LOAD)
             self.emit(slot)
-        elif isinstance(expr, UnOp):
-            self.gen_expr(expr.operand)
-            self.emit(OP_NEG if expr.op == "-" else OP_NOT)
-        elif isinstance(expr, BinOp):
-            self.gen_expr(expr.left)
-            self.gen_expr(expr.right)
-            self.emit(BINOP_OPCODE[expr.op])
-        elif isinstance(expr, Call):
+            return t
+
+        if isinstance(expr, Cast):
+            src_type = self.gen_expr(expr.expr)
+            self.emit_convert(src_type, expr.target_type)
+            return expr.target_type
+
+        if isinstance(expr, UnOp):
+            t = self.gen_expr(expr.operand)
+            if expr.op == "-":
+                self.emit(OP_FNEG if t == "float" else OP_NEG)
+                return t
+            if t != "int":
+                raise CompileError("'!' requires an int operand")
+            self.emit(OP_NOT)
+            return "int"
+
+        if isinstance(expr, BinOp):
+            if expr.op in LOGIC_OPS:
+                lt = self.gen_expr(expr.left)
+                if lt != "int":
+                    raise CompileError(f"'{expr.op}' requires int operands")
+                rt = self.gen_expr(expr.right)
+                if rt != "int":
+                    raise CompileError(f"'{expr.op}' requires int operands")
+                self.emit(BINOP_OPCODE[expr.op])
+                return "int"
+
+            # Arithmetic / comparison: promote to a common type. The left
+            # operand is emitted first, so its conversion (if any) has to
+            # happen before the right operand is emitted -- that requires
+            # knowing the right operand's type ahead of emitting it, hence
+            # infer_type() rather than a second gen_expr() call here.
+            lt = self.gen_expr(expr.left)
+            rt_type = self.infer_type(expr.right)
+            common = "float" if (lt == "float" or rt_type == "float") else "int"
+            if expr.op == "%" and common == "float":
+                raise CompileError("'%' has no float form")
+            self.emit_convert(lt, common)
+            rt = self.gen_expr(expr.right)
+            self.emit_convert(rt, common)
+            self.emit(BINOP_OPCODE_F[expr.op] if common == "float" else BINOP_OPCODE[expr.op])
+            return "int" if expr.op in COMPARISON_OPS else common
+
+        if isinstance(expr, Call):
             if expr.name not in self.syscalls:
                 raise CompileError(f"call to undeclared syscall '{expr.name}'")
-            id_, argc = self.syscalls[expr.name]
+            id_, argc, return_type = self.syscalls[expr.name]
             if len(expr.args) != argc:
                 raise CompileError(
                     f"'{expr.name}' declared with {argc} argument(s), called with {len(expr.args)}")
@@ -493,8 +676,9 @@ class Codegen:
             self.emit(OP_CALL)
             self.emit(id_)
             self.emit(len(expr.args))
-        else:
-            raise CompileError(f"internal error: unknown expression {expr!r}")
+            return return_type
+
+        raise CompileError(f"internal error: unknown expression {expr!r}")
 
 
 def compile_source(src):
@@ -504,7 +688,7 @@ def compile_source(src):
     for d in decls:
         if d.name in syscalls:
             raise CompileError(f"syscall '{d.name}' declared more than once")
-        syscalls[d.name] = (d.id, len(d.params))
+        syscalls[d.name] = (d.id, len(d.params), d.return_type)
     return Codegen(syscalls).gen_program(program)
 
 
@@ -518,9 +702,14 @@ _OPNAMES = {
     OP_EQ: "EQ", OP_NE: "NE", OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT",
     OP_JMP: "JMP", OP_JZ: "JZ", OP_JNZ: "JNZ", OP_CALL: "CALL",
+    OP_PUSH_F32: "PUSH_F32", OP_FADD: "FADD", OP_FSUB: "FSUB", OP_FMUL: "FMUL",
+    OP_FDIV: "FDIV", OP_FNEG: "FNEG", OP_FEQ: "FEQ", OP_FNE: "FNE",
+    OP_FLT: "FLT", OP_FLE: "FLE", OP_FGT: "FGT", OP_FGE: "FGE",
+    OP_I2F: "I2F", OP_F2I: "F2I",
 }
 _OPERAND_LEN = {
-    OP_PUSH_I32: 4, OP_LOAD: 1, OP_STORE: 1, OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2,
+    OP_PUSH_I32: 4, OP_PUSH_F32: 4, OP_LOAD: 1, OP_STORE: 1,
+    OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2,
 }
 
 
@@ -534,6 +723,9 @@ def disassemble(code: bytes) -> str:
         extra = _OPERAND_LEN.get(op, 0)
         if op == OP_PUSH_I32:
             val = int.from_bytes(code[pc + 1:pc + 5], "little", signed=True)
+            lines.append(f"{pc:4d}: {name} {val}")
+        elif op == OP_PUSH_F32:
+            val = struct.unpack("<f", code[pc + 1:pc + 5])[0]
             lines.append(f"{pc:4d}: {name} {val}")
         elif op in (OP_LOAD, OP_STORE):
             lines.append(f"{pc:4d}: {name} slot={code[pc + 1]}")

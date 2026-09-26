@@ -28,10 +28,30 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 HARNESS_CPP = r"""
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include "GAACEScript.h"
 using namespace GAACEScript;
-static int32_t sys_print(int32_t *args, uint8_t argc) { printf("%d\n", args[0]); return 0; }
+
+static float asFloat(int32_t bits) { float f; memcpy(&f, &bits, sizeof(f)); return f; }
+static int32_t asBits(float f) { int32_t bits; memcpy(&bits, &f, sizeof(bits)); return bits; }
+
+// Fixed syscall table shared by every test script (ids are positional, see
+// tools/test_gsc.py for which id means what):
+//   0: print(v)          int -> prints "<v>"
+//   1: printf(v)         float -> prints "F<v>"
+//   2: read_power()      float -> fixed fixture value, 125.0
+//   3: max_drive()       float -> fixed fixture value, 80.0
+//   4: set_max_drive(v)  float -> prints "S<v>"
+static int32_t sys_print(int32_t *args, uint8_t argc)   { printf("%d\n", args[0]); return 0; }
+static int32_t sys_printf(int32_t *args, uint8_t argc)  { printf("F%g\n", asFloat(args[0])); return 0; }
+static int32_t sys_read_power(int32_t *args, uint8_t argc) { return asBits(125.0f); }
+static int32_t sys_max_drive(int32_t *args, uint8_t argc)  { return asBits(80.0f); }
+static int32_t sys_set_max_drive(int32_t *args, uint8_t argc) {
+  printf("S%g\n", asFloat(args[0]));
+  return 0;
+}
+
 int main(int argc, char **argv) {
   int reps = (argc > 2) ? atoi(argv[2]) : 1;
   FILE *f = fopen(argv[1], "rb");
@@ -41,6 +61,10 @@ int main(int argc, char **argv) {
   VM vm;
   vmInit(vm, buf.data(), (uint16_t)buf.size());
   vmRegisterSyscall(vm, sys_print);
+  vmRegisterSyscall(vm, sys_printf);
+  vmRegisterSyscall(vm, sys_read_power);
+  vmRegisterSyscall(vm, sys_max_drive);
+  vmRegisterSyscall(vm, sys_set_max_drive);
   Status s = VM_OK;
   for (int i = 0; i < reps; i++) {
     vm.pc = 0; vm.sp = 0;   // rerun without vmInit: vars persist across reps
@@ -90,6 +114,31 @@ class StructuralTests(unittest.TestCase):
         self.assertIn("JZ ->", text)
         self.assertIn("JMP ->", text)
 
+    def test_float_literal_emits_push_f32(self):
+        code = gsc.compile_source("x = 3.5;")
+        self.assertIn(gsc.OP_PUSH_F32, code)
+        self.assertNotIn(gsc.OP_PUSH_I32, code)
+
+    def test_assigning_float_to_int_var_is_error(self):
+        with self.assertRaises(gsc.CompileError):
+            gsc.compile_source("x = 1; x = 2.5;")
+
+    def test_assigning_int_to_float_var_promotes(self):
+        code = gsc.compile_source("var x: float; x = 5;")
+        self.assertIn(gsc.OP_I2F, code)
+
+    def test_mod_with_float_operand_is_error(self):
+        with self.assertRaises(gsc.CompileError):
+            gsc.compile_source("x = 5.0 % 2;")
+
+    def test_logic_op_with_float_operand_is_error(self):
+        with self.assertRaises(gsc.CompileError):
+            gsc.compile_source("x = 5.0 && 1;")
+
+    def test_syscall_float_return_type(self):
+        code = gsc.compile_source("syscall watts() : float = 0; x = watts() + 1.0;")
+        self.assertIn(gsc.OP_FADD, code)
+
 
 @unittest.skipUnless(shutil.which("g++"), "g++ not available")
 class EndToEndVmTests(unittest.TestCase):
@@ -119,47 +168,91 @@ class EndToEndVmTests(unittest.TestCase):
                                  capture_output=True, text=True, check=True)
         status_line = [l for l in result.stderr.splitlines() if l.startswith("STATUS:")][0]
         status = int(status_line.split(":")[1])
-        prints = [int(l) for l in result.stdout.splitlines() if l.strip()]
-        return status, prints
+        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        return status, lines
 
     def test_bounded_loop_sum_1_to_5(self):
-        status, prints = self.run_script("""
+        status, lines = self.run_script("""
             syscall print(v) = 0;
             sum = 0; i = 1;
             while (i <= 5) { sum = sum + i; i = i + 1; }
             print(sum);
         """)
         self.assertEqual(status, 1)  # VM_HALTED
-        self.assertEqual(prints, [15])
+        self.assertEqual([int(l) for l in lines], [15])
 
     def test_if_else_both_branches(self):
-        status, prints = self.run_script("""
+        status, lines = self.run_script("""
             syscall print(v) = 0;
             if (7 > 3) { print(100); } else { print(200); }
             if (2 > 3) { print(100); } else { print(200); }
         """)
         self.assertEqual(status, 1)
-        self.assertEqual(prints, [100, 200])
+        self.assertEqual([int(l) for l in lines], [100, 200])
 
     def test_var_persists_across_reruns_without_reinit(self):
         # Mirrors the intended firmware pattern: vmInit() once, then only
         # pc/sp reset between ticks so a `var`-declared slot carries state.
-        status, prints = self.run_script("""
+        status, lines = self.run_script("""
             syscall print(v) = 0;
             var total;
             total = total + 1;
             print(total);
         """, reps=3)
         self.assertEqual(status, 1)
-        self.assertEqual(prints, [1, 2, 3])
+        self.assertEqual([int(l) for l in lines], [1, 2, 3])
 
     def test_logical_and_or_not(self):
-        status, prints = self.run_script("""
+        status, lines = self.run_script("""
             syscall print(v) = 0;
             print((1 && 0) + (1 || 0) + !0);
         """)
         self.assertEqual(status, 1)
-        self.assertEqual(prints, [2])  # 0 + 1 + 1
+        self.assertEqual([int(l) for l in lines], [2])  # 0 + 1 + 1
+
+    def test_float_literal_arithmetic(self):
+        status, lines = self.run_script("""
+            syscall printf(v) = 1;
+            printf((3.5 + 1.25) * 2.0);
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["F9.5"])
+
+    def test_int_promotes_to_float_in_mixed_expression(self):
+        status, lines = self.run_script("""
+            syscall printf(v) = 1;
+            x = 5;
+            y = x + 2.5;
+            printf(y);
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["F7.5"])
+
+    def test_explicit_float_to_int_cast_truncates(self):
+        status, lines = self.run_script("""
+            syscall print(v) = 0;
+            print((int)(7.9));
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual([int(l) for l in lines], [7])
+
+    def test_power_to_drive_example(self):
+        # The motivating use case: read a power level in watts (float), and
+        # if it's over a threshold, reduce a max-drive percentage (float).
+        status, lines = self.run_script("""
+            syscall read_power() : float = 2;
+            syscall max_drive() : float = 3;
+            syscall set_max_drive(v) = 4;
+
+            watts = read_power();
+            if (watts > 100.0) {
+                drive = max_drive() - 5.0;
+                set_max_drive(drive);
+            }
+        """)
+        self.assertEqual(status, 1)
+        # fixture: read_power()=125.0, max_drive()=80.0 -> 125>100, so 80-5=75
+        self.assertEqual(lines, ["S75"])
 
 
 if __name__ == "__main__":

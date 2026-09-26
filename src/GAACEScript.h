@@ -18,11 +18,19 @@ namespace GAACEScript {
 
 // ---------------------------------------------------------------------------
 // Bytecode format: 1 opcode byte, followed by 0+ operand bytes (little-endian).
-//   OP_PUSH_I32 <i32>        5 bytes total
-//   OP_LOAD/STORE <slot>     2 bytes total
-//   OP_JMP/JZ/JNZ <u16 abs>  3 bytes total (absolute jump target, not relative)
-//   OP_CALL <id> <argc>      3 bytes total
-//   everything else          1 byte (no operand)
+//   OP_PUSH_I32 / OP_PUSH_F32 <4 bytes>  5 bytes total
+//   OP_LOAD/STORE <slot>                 2 bytes total
+//   OP_JMP/JZ/JNZ <u16 abs>              3 bytes total (absolute, not relative)
+//   OP_CALL <id> <argc>                  3 bytes total
+//   everything else                      1 byte (no operand)
+//
+// Floats: a stack/variable slot is just 4 bytes with no type tag anywhere --
+// OP_PUSH_F32's operand bytes are the IEEE754 bit pattern of the constant,
+// and F-prefixed opcodes (FADD, FLT, ...) reinterpret whatever bits are on
+// the stack as float32 rather than int32. Nothing else about the VM changes:
+// it's the opcode, not the value, that carries the type. The compiler
+// (gsc.py) is responsible for emitting the right opcode for each operand's
+// static type; the VM itself does no runtime type checking.
 // ---------------------------------------------------------------------------
 enum Opcode : uint8_t {
   OP_HALT = 0x00,
@@ -50,6 +58,20 @@ enum Opcode : uint8_t {
   OP_JZ,
   OP_JNZ,
   OP_CALL,
+  OP_PUSH_F32,
+  OP_FADD,
+  OP_FSUB,
+  OP_FMUL,
+  OP_FDIV,
+  OP_FNEG,
+  OP_FEQ,
+  OP_FNE,
+  OP_FLT,
+  OP_FLE,
+  OP_FGT,
+  OP_FGE,
+  OP_I2F,   // pop int32, push its float32 conversion
+  OP_F2I,   // pop float32, push its int32 truncation (toward zero)
 };
 
 enum Status : uint8_t {
