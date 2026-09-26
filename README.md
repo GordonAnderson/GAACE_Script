@@ -60,11 +60,12 @@ library from day one rather than a one-off inside a single project.
   unmodified for both Teensy 4.1 and an Adafruit Feather M0 (SAMD21).
 
 - **The compiler lives on the host, not the device.** The firmware only
-  ever needs the interpreter loop — there's no text parser on-device. A
-  script is compiled to bytecode on the PC and sent over to the device
-  (e.g. as a command-processor command carrying hex bytes); the examples
-  here hand-assemble bytecode directly to demonstrate the VM without
-  requiring that host-side tool yet.
+  ever needs the interpreter loop — there's no text parser on-device.
+  `tools/gsc.py` compiles a small C-like script (variables, `if`/`else`,
+  bounded `while`, syscalls) to bytecode on the PC; see
+  [tools/README.md](tools/README.md). The example under `examples/` still
+  hand-assembles bytecode directly, to demonstrate the VM without depending
+  on the compiler.
 - **Scripts must be bounded.** `vmRun()` is meant to be called from a
   cooperative scheduler (e.g. `ArduinoThread`), the same way a periodic
   ADC-read-and-inject feature would run today — it must return promptly, so
@@ -80,6 +81,9 @@ lib/GAACE_Script_core  symlink to ../src, so PlatformIO's Library
                        environment (native included)
 examples/BasicScript/  a bounded loop + if/else + a syscall round-trip
 test/test_vm/          native unit tests (Unity), no hardware required
+tools/gsc.py           host-side compiler (script source -> bytecode)
+tools/test_gsc.py      compiler tests, including end-to-end runs against
+                       the real VM
 ```
 
 ## Building
