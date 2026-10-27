@@ -32,18 +32,25 @@ if (watts > 100.0) {
 python3 tools/gsc.py drive_limit.gs --upload /dev/ttyUSB0 --slot 1
 ```
 
-Compiles, opens that serial port itself, sends `SCRIPTLOAD,1,<hex>` (the
-code and string-constant pool combined with the `[codeLen][code][pool]`
-length prefix `SCRIPTLOAD` expects), and prints the result:
+Compiles, opens that serial port itself, and sends the result (the code and
+string-constant pool combined with the `[codeLen][code][pool]` length
+prefix the device expects). For a small script that's a single
+`SCRIPTLOAD,1,<hex>`; past `--chunk-bytes` (default 200 decoded bytes —
+`SCRIPTLOAD`'s real ceiling, see `GAACEScriptRuntime.h`), it switches to
+several `SCRIPTAPPEND,1,<offset>,<hexchunk>` calls finished with
+`SCRIPTCOMMIT,1,<totalLen>` automatically — nothing to choose by hand:
 
 ```
-OK: script loaded into slot 1 (12 bytes)
+OK: script loaded into slot 1 (12 bytes, single SCRIPTLOAD)
+```
+```
+OK: script loaded into slot 1 (640 bytes, 4 SCRIPTAPPEND chunks + SCRIPTCOMMIT)
 ```
 
 or, on failure:
 
 ```
-NAK: device rejected the script (bad slot, malformed hex, or over
+NAK: device rejected SCRIPTLOAD (bad slot/offset, malformed hex, or over
 the configured size limit -- see GSCRIPTLIMITS)
 ```
 

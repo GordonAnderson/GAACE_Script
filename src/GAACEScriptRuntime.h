@@ -21,14 +21,34 @@
 //
 // New commands (see GAACEScriptRuntime.cpp for exact behavior):
 //   SCRIPTLOAD,<slot>,<hex>   Decode <hex> ([codeLen:u16][code][pool] -- see
-//                             gsc.py --scriptload) and load it into <slot>.
-//                             NAKs (ERR_BADARG) on a bad slot index,
-//                             malformed hex, or a decoded payload over the
-//                             per-project GAACE_SCRIPT_MAX_CODE_LEN limit.
+//                             gsc.py --scriptload) and load it into <slot>
+//                             in one call. NAKs (ERR_BADARG) on a bad slot
+//                             index, malformed hex, or a decoded payload
+//                             over the per-project GAACE_SCRIPT_MAX_CODE_LEN
+//                             limit. Only practical for small scripts -- see
+//                             SCRIPTAPPEND below for why, and for anything
+//                             bigger.
+//   SCRIPTAPPEND,<slot>,<offset>,<hexchunk>
+//                             Decode <hexchunk> directly into <slot>'s
+//                             buffer at byte <offset>, without finalizing.
+//                             Lets a script larger than one command's worth
+//                             of hex (see the GAACE_SCRIPT_MAX_CODE_LEN note
+//                             below) be assembled across many small calls --
+//                             gsc.py --upload does this automatically once a
+//                             script is too big for a single SCRIPTLOAD.
+//                             Marks the slot not-loaded until SCRIPTCOMMIT.
+//   SCRIPTCOMMIT,<slot>,<totalLen>
+//                             Finalize a buffer assembled via one or more
+//                             SCRIPTAPPEND calls: validate the
+//                             [codeLen:u16][code][pool] layout against
+//                             <totalLen>, then load it into <slot> exactly
+//                             like SCRIPTLOAD does.
 //   GSCRIPTLIMITS             slots,maxCodeLen,stackSize,varSlots,maxSyscalls
-//                             (maxCodeLen is the SCRIPTLOAD payload budget,
+//                             (maxCodeLen is the payload budget per slot,
 //                             i.e. the 2-byte length prefix + code + pool
-//                             combined, not code alone)
+//                             combined, not code alone -- this is the ceiling
+//                             SCRIPTAPPEND/SCRIPTCOMMIT assemble up to, not
+//                             SCRIPTLOAD's one-call limit)
 //   GSCRIPTST,<slot>          loaded(0|1),lastStatus  (see GAACEScript.h's
 //                             Status enum; 1 = VM_HALTED)
 //
@@ -42,21 +62,29 @@
 // Build configuration
 // --------------------
 //   -D GAACE_SCRIPT_SLOTS=<n>          Number of script slots (default 4).
-//   -D GAACE_SCRIPT_MAX_CODE_LEN=<n>   Max SCRIPTLOAD payload bytes per slot
-//                                      (default 128) -- the 2-byte length
-//                                      prefix, code, and pool (if the
-//                                      script uses cmd()) combined, not
-//                                      code alone. NOTE: SCRIPTLOAD's hex argument
+//   -D GAACE_SCRIPT_MAX_CODE_LEN=<n>   Max payload bytes per slot (default
+//                                      128) -- the 2-byte length prefix,
+//                                      code, and pool (if the script uses
+//                                      cmd()) combined, not code alone. Safe
+//                                      to raise generously (it's just RAM):
+//                                      this is a per-slot buffer size, not a
+//                                      per-command transfer size. NOTE:
+//                                      SCRIPTLOAD's hex argument specifically
 //                                      is decoded through commandProcessor's
 //                                      shared charAllocate scratch arena,
 //                                      which is a fixed 512 bytes across the
 //                                      whole commandProcessor instance (see
 //                                      GAACE_Core's commandProcessor.cpp) --
-//                                      raising this well past the default
-//                                      risks that one SCRIPTLOAD call (hex
-//                                      is 2x the byte count) can no longer
-//                                      fit alongside the slot-index argument
-//                                      in that arena.
+//                                      a single SCRIPTLOAD call can only ever
+//                                      deliver roughly half that in decoded
+//                                      bytes, regardless of this setting. Use
+//                                      SCRIPTAPPEND/SCRIPTCOMMIT (gsc.py
+//                                      --upload does this automatically) to
+//                                      actually fill a buffer larger than
+//                                      that -- raising GAACE_SCRIPT_MAX_CODE_LEN
+//                                      alone does not help SCRIPTLOAD reach
+//                                      further, only how much SCRIPTAPPEND
+//                                      can ultimately assemble.
 //   -D GAACE_SCRIPT_STACK_SIZE / GAACE_SCRIPT_VAR_SLOTS / GAACE_SCRIPT_MAX_SYSCALLS
 //                                      Per-VM limits -- see GAACEScript.h.
 //

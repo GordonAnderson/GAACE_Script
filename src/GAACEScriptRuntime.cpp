@@ -117,6 +117,101 @@ static void cmdScriptLoad(void) {
 }
 
 // -----------------------------------------------------------------------
+// SCRIPTAPPEND,<slot>,<offset>,<hexchunk> — write a decoded hex chunk
+// directly into slot <slot>'s raw payload buffer at byte offset <offset>,
+// without touching vmInit/vmSetPool. Call SCRIPTCOMMIT once every chunk has
+// been written.
+//
+// Why this exists: SCRIPTLOAD's <hex> argument is decoded through
+// commandProcessor's shared 512-byte charAllocate scratch arena (see this
+// file's header for the full explanation), so one SCRIPTLOAD call can only
+// ever deliver roughly its half in decoded bytes -- raising
+// GAACE_SCRIPT_MAX_CODE_LEN past that does not help, because the payload
+// can never arrive in one piece regardless of how big the destination
+// buffer is. SCRIPTAPPEND sidesteps this entirely: each call's hex chunk is
+// small (the caller's choice -- gsc.py --upload defaults to 200 decoded
+// bytes), so no single call goes anywhere near the arena's ceiling no
+// matter how large the total script is. A slot's buffer is only bounded by
+// GAACE_SCRIPT_MAX_CODE_LEN, which is just RAM and can be set generously.
+//
+// Marks the slot not-loaded for the duration: a buffer mid-assembly must
+// never be treated as runnable, even if a previous script happens to still
+// be sitting in the same slot's memory from before this upload started.
+// -----------------------------------------------------------------------
+static void cmdScriptAppend(void) {
+  commandProcessor &cp = *activeInstance->cp_;
+  if (!cp.checkExpectedArgs(3)) return;
+
+  // See cmdScriptLoad()/cmdScriptStatus() above for why these aren't
+  // cp.getValue(&x, 0, upperBound) -- same ll==0&&ul==0 "no range check"
+  // footgun when an upper bound can legitimately be 0.
+  int slot;
+  if (!cp.getValue(&slot) || slot < 0 || slot >= SCRIPT_SLOTS) {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  int offset;
+  if (!cp.getValue(&offset) || offset < 0 || offset >= (int)SCRIPT_MAX_CODE_LEN) {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  char *hex;
+  if (!cp.getValue(&hex)) { cp.sendNAK(ERR_BADARG); return; }
+
+  ScriptSlot &s = activeInstance->slots[slot];
+  s.loaded = false;   // a partially-written buffer must never be runnable
+
+  uint16_t decodedLen = 0;
+  bool ok = hexDecode(hex, s.code + offset,
+                       (uint16_t)(SCRIPT_MAX_CODE_LEN - offset), decodedLen);
+  cp.ca->free(hex);
+
+  if (!ok) { cp.sendNAK(ERR_BADARG); return; }
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------
+// SCRIPTCOMMIT,<slot>,<totalLen> — finalize a buffer assembled via one or
+// more SCRIPTAPPEND calls: validates the [codeLen:u16][code][pool] layout
+// against <totalLen> exactly like SCRIPTLOAD does against its decoded
+// length, then vmInit()/vmSetPool() and marks the slot loaded. <totalLen>
+// is the exact byte count the caller wrote via SCRIPTAPPEND (not a hex
+// character count) -- gsc.py --upload tracks and sends this itself.
+// -----------------------------------------------------------------------
+static void cmdScriptCommit(void) {
+  commandProcessor &cp = *activeInstance->cp_;
+  if (!cp.checkExpectedArgs(2)) return;
+
+  int slot;
+  if (!cp.getValue(&slot) || slot < 0 || slot >= SCRIPT_SLOTS) {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  int totalLen;
+  if (!cp.getValue(&totalLen) || totalLen < 2 || totalLen > (int)SCRIPT_MAX_CODE_LEN) {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+
+  ScriptSlot &s = activeInstance->slots[slot];
+
+  uint16_t codeLen = (uint16_t)((uint8_t)s.code[0] | ((uint8_t)s.code[1] << 8));
+  if (codeLen > (uint16_t)totalLen - 2) { cp.sendNAK(ERR_BADARG); return; }
+  uint16_t poolLen = (uint16_t)((uint16_t)totalLen - 2 - codeLen);
+
+  s.codeLen = codeLen;
+  vmInit(s.vm, s.code + 2, codeLen);
+  // Always called, even for poolLen 0 -- see cmdScriptLoad()'s identical note.
+  vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
+  s.loaded = true;
+  s.lastStatus = VM_OK;
+  cp.sendACK();
+}
+
+// -----------------------------------------------------------------------
 // GSCRIPTLIMITS — slots,maxCodeLen,stackSize,varSlots,maxSyscalls
 // -----------------------------------------------------------------------
 static void cmdScriptLimits(void) {
@@ -158,6 +253,10 @@ static void cmdScriptStatus(void) {
 static Command scriptCmds[] = {
   {"SCRIPTLOAD",   CMDfunction, 2, (void *)cmdScriptLoad,   NULL,
    "SCRIPTLOAD,<slot>,<hex> -- load a compiled script into a slot"},
+  {"SCRIPTAPPEND", CMDfunction, 3, (void *)cmdScriptAppend, NULL,
+   "SCRIPTAPPEND,<slot>,<offset>,<hexchunk> -- write a chunk into a slot's buffer"},
+  {"SCRIPTCOMMIT", CMDfunction, 2, (void *)cmdScriptCommit, NULL,
+   "SCRIPTCOMMIT,<slot>,<totalLen> -- finalize a buffer assembled via SCRIPTAPPEND"},
   {"GSCRIPTLIMITS", CMDfunction, 0, (void *)cmdScriptLimits, NULL,
    "slots,maxCodeLen,stackSize,varSlots,maxSyscalls"},
   {"GSCRIPTST",     CMDfunction, 1, (void *)cmdScriptStatus, NULL,

@@ -43,10 +43,15 @@ the working list of what's still unresolved.
 
 ## Not yet built
 
-- [ ] **Script persistence across reboot.** `SCRIPTLOAD`-loaded scripts
-      are RAM-only; a reboot loses them. The filesystem-based save/load/
-      load-on-boot idea (for platforms that have one, e.g. Teensy 4.1's
-      LittleFS) is still just an idea — see `USBrepeater/TODO.md`.
+- [ ] **Script persistence across reboot.** `SCRIPTLOAD`/`SCRIPTAPPEND`-
+      loaded scripts are RAM-only; a reboot loses them. The filesystem-
+      based save/load/load-on-boot idea (for platforms that have one, e.g.
+      Teensy 4.1's `LittleFS_Program`) is still just an idea — see
+      `USBrepeater/TODO.md`. Likely the next piece of work after
+      `SCRIPTAPPEND`/`SCRIPTCOMMIT` above; saving/restoring a slot's buffer
+      to/from a file is plain buffer<->file I/O with no size ceiling of
+      its own (unlike the serial transfer this just fixed), so the two
+      pieces compose cleanly once this exists.
 - [ ] **A general "device just rebooted" notification.** Raised during
       design discussion as a real gap (a host has no way to know a
       script's state was lost to an unexpected reset) — it's a
@@ -64,16 +69,28 @@ the working list of what's still unresolved.
 
 ## Worth remembering, not necessarily broken
 
-- [ ] `SCRIPTLOAD`'s hex argument is decoded through commandProcessor's
-      shared 512-byte `charAllocate` scratch arena (see
-      `GAACEScriptRuntime.h`'s build-configuration comment). A script that
-      leans heavily on `cmd()` grows its string pool inside the same
-      `GAACE_SCRIPT_MAX_CODE_LEN` budget as its code — watch this if
-      scripts get more ambitious.
-- [ ] USBrepeater is still pinned to the `GAACE_Script` commit from before
-      `cmd()`/floats/the standard runtime's later refinements existed. The
-      capstone proof for all of that so far is `test/test_runtime` (an
-      isolated test rig on an Adafruit QT Py M0), not a real product's
-      actual command set. Worth doing once there's an actual reason to
-      (e.g. USBrepeater's ADC demo rewritten to use `cmd()` instead of its
-      three hand-written syscalls).
+- [x] **Resolved (2026-10-27): `SCRIPTAPPEND`/`SCRIPTCOMMIT`.** `SCRIPTLOAD`'s
+      hex argument is decoded through commandProcessor's shared 512-byte
+      `charAllocate` scratch arena, so one `SCRIPTLOAD` call can only ever
+      deliver roughly half that in decoded bytes — raising
+      `GAACE_SCRIPT_MAX_CODE_LEN` past that doesn't help, the payload
+      simply can't arrive in one piece. `SCRIPTAPPEND,<slot>,<offset>,
+      <hexchunk>` + `SCRIPTCOMMIT,<slot>,<totalLen>` assemble a slot's
+      buffer across many small calls instead, each individually well under
+      the arena's ceiling regardless of total script size. `gsc.py
+      --upload` picks single-`SCRIPTLOAD` vs. chunked automatically based
+      on size (`--chunk-bytes`, default 200). `GAACE_SCRIPT_MAX_CODE_LEN`
+      is now meaningfully raisable (it bounds what `SCRIPTAPPEND` can
+      ultimately assemble, not what one command can transfer) — ultimately
+      a USBrepeater `platformio.ini` decision, not this repo's.
+      A script that leans heavily on `cmd()` still grows its string pool
+      inside the same per-slot budget as its code — watch this if scripts
+      get more ambitious, chunking doesn't change that tradeoff.
+- [x] **Resolved (2026-10-27): USBrepeater pin.** It's building against
+      current `main` (confirmed via its own `Dependency Graph` output,
+      commit `32139a2` — the one with `cmd()`/floats/`--upload`/this note's
+      own predecessor). This item was stale when written; likely true
+      immediately after a fresh `lib_deps` pull, false again after any
+      `rm -rf .pio` since `lib_deps` tracks a branch HEAD, not a pin. Not
+      a real pin — re-verify by reading `Dependency Graph` output rather
+      than assuming either way.

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import gsc  # noqa: E402
@@ -315,6 +316,103 @@ class EndToEndVmTests(unittest.TestCase):
         """)
         self.assertEqual(status, 1)
         self.assertEqual(lines, ["CMD:GVER", "123"])
+
+
+class _FakeSerialPort:
+    """Minimal stand-in for serial.Serial used by the upload_script() tests
+    below. Records every line written (decoded, without the trailing \\n)
+    and pops one canned response per write+read pair, in order -- enough to
+    drive upload_script()'s send()/report_failure() without a real port."""
+
+    def __init__(self, responses):
+        self.sent = []
+        self._responses = list(responses)
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        self.sent.append(data.decode("ascii").rstrip("\n"))
+
+    def read(self, n):
+        return self._responses.pop(0) if self._responses else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeSerialModule:
+    """Stand-in for the `serial` module, installed into sys.modules so
+    gsc.py's `import serial` (inside upload_script()) finds this instead."""
+
+    class SerialException(Exception):
+        pass
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.last_port = None
+
+    def Serial(self, port, baud, timeout=3.0):
+        self.last_port = _FakeSerialPort(self._responses)
+        return self.last_port
+
+
+class UploadChunkingTests(unittest.TestCase):
+    """upload_script()'s SCRIPTLOAD-vs-chunked-SCRIPTAPPEND/SCRIPTCOMMIT
+    decision and the exact commands it sends, per GAACEScriptRuntime.h's
+    SCRIPTAPPEND/SCRIPTCOMMIT addition -- no real serial port involved."""
+
+    def _run_upload(self, payload_hex, chunk_bytes, responses):
+        fake_module = _FakeSerialModule(responses)
+        with mock.patch.dict(sys.modules, {"serial": fake_module}):
+            status = gsc.upload_script("FAKE", 0, payload_hex, chunk_bytes=chunk_bytes)
+        return status, fake_module.last_port.sent
+
+    def test_small_payload_uses_single_scriptload(self):
+        status, sent = self._run_upload("aabbccdd", chunk_bytes=200, responses=[b"\x06"])
+        self.assertEqual(status, 0)
+        self.assertEqual(sent, ["SCRIPTLOAD,0,aabbccdd"])
+
+    def test_payload_exactly_at_chunk_size_still_uses_single_scriptload(self):
+        payload_hex = "aa" * 4  # 4 decoded bytes == chunk_bytes, not over it
+        status, sent = self._run_upload(payload_hex, chunk_bytes=4, responses=[b"\x06"])
+        self.assertEqual(status, 0)
+        self.assertEqual(sent, [f"SCRIPTLOAD,0,{payload_hex}"])
+
+    def test_large_payload_chunks_then_commits(self):
+        # 10 decoded bytes, chunk_bytes=4 -> chunks at offset 0, 4, 8
+        payload_hex = "".join(f"{b:02x}" for b in range(10))
+        status, sent = self._run_upload(
+            payload_hex, chunk_bytes=4,
+            responses=[b"\x06", b"\x06", b"\x06", b"\x06"],
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(sent, [
+            "SCRIPTAPPEND,0,0," + payload_hex[0:8],
+            "SCRIPTAPPEND,0,4," + payload_hex[8:16],
+            "SCRIPTAPPEND,0,8," + payload_hex[16:20],
+            "SCRIPTCOMMIT,0,10",
+        ])
+
+    def test_nak_on_append_aborts_without_committing(self):
+        payload_hex = "".join(f"{b:02x}" for b in range(10))
+        status, sent = self._run_upload(
+            payload_hex, chunk_bytes=4,
+            responses=[b"\x06", b"\x15"],  # second chunk NAKed
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(sent, [
+            "SCRIPTAPPEND,0,0," + payload_hex[0:8],
+            "SCRIPTAPPEND,0,4," + payload_hex[8:16],
+        ])  # SCRIPTCOMMIT never sent
+
+    def test_no_response_is_reported_and_fails(self):
+        status, sent = self._run_upload("aabbccdd", chunk_bytes=200, responses=[b""])
+        self.assertEqual(status, 1)
+        self.assertEqual(sent, ["SCRIPTLOAD,0,aabbccdd"])
 
 
 if __name__ == "__main__":
