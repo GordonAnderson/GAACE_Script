@@ -99,9 +99,18 @@ Not every use case wants runtime download. USBrepeater's shipped ADC demo
 instead compiles once (`gsc.py` without `--scriptload`), pastes the result
 into a C array in firmware source, and loads it by calling `vmInit()`
 directly in `setup()`. That needs a full rebuild+reflash to change, but the
-script survives a reboot automatically (it's in flash, not RAM) — whereas
-today, a `SCRIPTLOAD`-loaded script does **not** survive a reboot (see
-`USBrepeater/TODO.md`'s persistence item).
+script survives a reboot automatically (it's in flash, not RAM).
+
+A `SCRIPTLOAD`/`SCRIPTAPPEND`-loaded script is RAM-only as far as this
+library is concerned — but USBrepeater adds its own `SCRIPTSAVE`/
+`SCRIPTRESTORE` commands (plus automatic restore-on-boot) on top of
+`ScriptRuntime`, using Teensy's `LittleFS_Program` to persist a slot's
+exact buffer to on-chip flash. That's a project-level addition, not
+something this library does for you generically (it would mean a Teensy
+dependency in a library that's otherwise hardware-agnostic) — see
+`USBrepeater/TODO.md` for the actual implementation, and this repo's own
+`TODO.md` for why `ScriptSlot`'s public fields were left that way
+specifically to make this possible without changes here.
 
 ## Current gaps
 

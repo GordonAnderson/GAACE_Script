@@ -43,15 +43,26 @@ the working list of what's still unresolved.
 
 ## Not yet built
 
-- [ ] **Script persistence across reboot.** `SCRIPTLOAD`/`SCRIPTAPPEND`-
-      loaded scripts are RAM-only; a reboot loses them. The filesystem-
-      based save/load/load-on-boot idea (for platforms that have one, e.g.
-      Teensy 4.1's `LittleFS_Program`) is still just an idea — see
-      `USBrepeater/TODO.md`. Likely the next piece of work after
-      `SCRIPTAPPEND`/`SCRIPTCOMMIT` above; saving/restoring a slot's buffer
-      to/from a file is plain buffer<->file I/O with no size ceiling of
-      its own (unlike the serial transfer this just fixed), so the two
-      pieces compose cleanly once this exists.
+- [x] **Resolved (2026-10-27): script persistence across reboot —
+      implemented, but at the consuming-project level, not in this
+      library.** `SCRIPTLOAD`/`SCRIPTAPPEND`-loaded scripts are still
+      RAM-only as far as `ScriptRuntime` itself is concerned; USBrepeater
+      added `SCRIPTSAVE`/`SCRIPTRESTORE` plus boot-time auto-restore on top
+      of it (`src/USBrepeater.cpp`, "Script slot persistence" in Section
+      6b), using `LittleFS_Program` (Teensy-only) to save/restore a slot's
+      raw `code[]` buffer verbatim — no new wire format needed, since that
+      buffer already *is* `SCRIPTLOAD`'s `[codeLen][code][pool]` payload.
+      Deliberately not pulled into `ScriptRuntime`/`GAACEScript.h`
+      themselves: this library's whole value is staying hardware-agnostic
+      (no `Serial`, no Teensy headers in the VM core — see the syscall-
+      boundary design in `USBrepeater/TODO.md`), and `LittleFS_Program` is
+      Teensy-specific. `ScriptSlot::code[]`, `VM::codeLen`, and
+      `VM::poolLen` being public fields was exactly what made this
+      possible to build entirely in the consuming project with zero
+      changes here — worth keeping that way if a different project ever
+      wants its own persistence mechanism (an SD card, a different flash
+      API, etc.). See `USBrepeater/TODO.md` for the actual implementation
+      and its real-hardware-testing status.
 - [ ] **A general "device just rebooted" notification.** Raised during
       design discussion as a real gap (a host has no way to know a
       script's state was lost to an unexpected reset) — it's a
