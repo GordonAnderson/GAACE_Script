@@ -30,7 +30,7 @@ Language (informal grammar):
     cast        := "(" type ")" unary
     primary     := NUMBER | FLOAT | IDENT | IDENT "(" (expr ("," expr)*)? ")"
                  | cmd_call | "(" expr ")"
-    cmd_call    := "cmd" "(" STRING ("," expr)* ")"
+    cmd_call    := ("cmd" | "cmdf") "(" STRING ("," expr)* ")"
 
 Notes:
   - Two numeric types: `int` (int32) and `float` (IEEE754 float32) — see
@@ -86,6 +86,11 @@ cmd() -- calling into the command processor directly:
     no return value). NAK and "ACK with value 0" are not distinguishable
     from the return value alone -- check what you're calling if that
     matters.
+  - `cmdf("NAME", args...)` is the same call but returns a float: the
+    response is parsed as a float32 (so "3.14" comes back as 3.14, not 3).
+    Same NAK/no-number -> 0.0 rule. The script has to pick cmd() vs cmdf()
+    up front because values carry no runtime type tag -- use cmdf() for any
+    command whose reply can have a fractional part.
   - Arguments aren't type-checked (same as syscalls) -- floats can be
     passed, but the receiving command decides how to interpret them.
   - Compiled output for a script that uses cmd() includes a second
@@ -146,6 +151,7 @@ OP_FGE      = 0x24
 OP_I2F      = 0x25
 OP_F2I      = 0x26
 OP_CMDCALL  = 0x27
+OP_CMDCALLF = 0x28
 
 VAR_SLOTS = 16
 
@@ -184,7 +190,7 @@ TOKEN_RE = re.compile(r"""
   | (?P<OP>==|!=|<=|>=|&&|\|\||[(){};,=+\-*/%<>!:])
 """, re.VERBOSE)
 
-KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float", "cmd"}
+KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float", "cmd", "cmdf"}
 
 
 class Token:
@@ -246,7 +252,8 @@ class Call:
     def __init__(self, name, args): self.name, self.args = name, args
 
 class CmdCall:
-    def __init__(self, cmd_name, args): self.cmd_name, self.args = cmd_name, args
+    def __init__(self, cmd_name, args, is_float=False):
+        self.cmd_name, self.args, self.is_float = cmd_name, args, is_float
 
 class UnOp:
     def __init__(self, op, operand): self.op, self.operand = op, operand
@@ -463,7 +470,7 @@ class Parser:
                 self.expect(")")
                 return Call(t.value, args)
             return Var(t.value)
-        if t.kind == "cmd":
+        if t.kind in ("cmd", "cmdf"):
             self.advance()
             self.expect("(")
             name_tok = self.expect("STRING")
@@ -472,7 +479,7 @@ class Parser:
                 self.advance()
                 args.append(self.parse_expr())
             self.expect(")")
-            return CmdCall(name_tok.value, args)
+            return CmdCall(name_tok.value, args, is_float=(t.kind == "cmdf"))
         if t.kind == "(":
             self.advance()
             e = self.parse_expr()
@@ -587,7 +594,7 @@ class Codegen:
                 raise CompileError(f"call to undeclared syscall '{expr.name}'")
             return self.syscalls[expr.name][2]
         if isinstance(expr, CmdCall):
-            return "int"
+            return "float" if expr.is_float else "int"
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
     def emit_jump(self, op, label):
@@ -739,10 +746,10 @@ class Codegen:
                 raise CompileError(f"cmd({expr.cmd_name!r}, ...) has too many arguments")
             for a in expr.args:
                 self.gen_expr(a)
-            self.emit(OP_CMDCALL)
+            self.emit(OP_CMDCALLF if expr.is_float else OP_CMDCALL)
             self.buf += offset.to_bytes(2, "little")
             self.emit(len(expr.args))
-            return "int"
+            return "float" if expr.is_float else "int"
 
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
@@ -787,11 +794,11 @@ _OPNAMES = {
     OP_PUSH_F32: "PUSH_F32", OP_FADD: "FADD", OP_FSUB: "FSUB", OP_FMUL: "FMUL",
     OP_FDIV: "FDIV", OP_FNEG: "FNEG", OP_FEQ: "FEQ", OP_FNE: "FNE",
     OP_FLT: "FLT", OP_FLE: "FLE", OP_FGT: "FGT", OP_FGE: "FGE",
-    OP_I2F: "I2F", OP_F2I: "F2I", OP_CMDCALL: "CMDCALL",
+    OP_I2F: "I2F", OP_F2I: "F2I", OP_CMDCALL: "CMDCALL", OP_CMDCALLF: "CMDCALLF",
 }
 _OPERAND_LEN = {
     OP_PUSH_I32: 4, OP_PUSH_F32: 4, OP_LOAD: 1, OP_STORE: 1,
-    OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2, OP_CMDCALL: 3,
+    OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2, OP_CMDCALL: 3, OP_CMDCALLF: 3,
 }
 
 
@@ -823,7 +830,7 @@ def disassemble(code: bytes, pool: bytes = b"") -> str:
             lines.append(f"{pc:4d}: {name} -> {target}")
         elif op == OP_CALL:
             lines.append(f"{pc:4d}: {name} id={code[pc + 1]} argc={code[pc + 2]}")
-        elif op == OP_CMDCALL:
+        elif op in (OP_CMDCALL, OP_CMDCALLF):
             offset = int.from_bytes(code[pc + 1:pc + 3], "little")
             argc = code[pc + 3]
             name_str = _pool_string_at(pool, offset)

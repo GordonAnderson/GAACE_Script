@@ -28,11 +28,12 @@ static ScriptRuntime *activeInstance = nullptr;
 // shared ring buffer/output stream a real command might be mid-arriving
 // on -- see that method's own doc comment for why that isolation matters.
 //
-// Return value: the response parsed as a number on ACK, 0 on NAK or a
-// response with no trailing number (e.g. a plain action command). NAK and
+// Return value: the response parsed as a number on ACK (an int for cmd(), a
+// float32 bit-cast into the int32 for cmdf()), 0 on NAK or a response with
+// no trailing number (e.g. a plain action command). NAK and
 // "ACK with value 0" are not distinguishable from the return value alone.
 // -----------------------------------------------------------------------
-static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc) {
+static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat) {
   commandProcessor &cp = *activeInstance->cp_;
 
   char line[64];
@@ -44,8 +45,14 @@ static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc) {
   char response[48];
   cp.executeLine(line, response, sizeof(response));
 
-  if ((uint8_t)response[0] == 0x06) return (int32_t)atoi(response + 1);
-  return 0;
+  if ((uint8_t)response[0] != 0x06) return 0;  // NAK (0 / 0.0f both read as 0 bits)
+  if (wantFloat) {
+    float f = (float)atof(response + 1);
+    int32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    return bits;
+  }
+  return (int32_t)atoi(response + 1);
 }
 
 ScriptRuntime::ScriptRuntime(commandProcessor *cpArg, ThreadController *tasks,

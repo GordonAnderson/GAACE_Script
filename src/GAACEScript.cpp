@@ -271,7 +271,8 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
         break;
       }
 
-      case OP_CMDCALL: {
+      case OP_CMDCALL:
+      case OP_CMDCALLF: {
         if ((uint32_t)vm.pc + 4 > vm.codeLen) return VM_ERR_BAD_JUMP;
         uint16_t poolOffset = readU16(&vm.code[vm.pc + 1]);
         uint8_t  argc       = vm.code[vm.pc + 3];
@@ -291,7 +292,8 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
           Status s = pop(vm, args[i]);
           if (s != VM_OK) return s;
         }
-        int32_t r = vm.cmdBridge((const char *)&vm.pool[poolOffset], args, argc);
+        int32_t r = vm.cmdBridge((const char *)&vm.pool[poolOffset], args, argc,
+                                (op == OP_CMDCALLF));
         Status s = push(vm, r);
         if (s != VM_OK) return s;
         vm.pc += 4;

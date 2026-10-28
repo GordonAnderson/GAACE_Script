@@ -56,10 +56,11 @@ static int32_t sys_set_max_drive(int32_t *args, uint8_t argc) {
 // Fake cmd() bridge: prints "CMD:<name>,<arg0>,<arg1>,...\n" so tests can
 // verify the right name/args reached it, and returns a fixed value the
 // script can act on.
-static int32_t fake_cmd_bridge(const char *name, int32_t *args, uint8_t argc) {
+static int32_t fake_cmd_bridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat) {
   printf("CMD:%s", name);
   for (uint8_t i = 0; i < argc; i++) printf(",%d", args[i]);
   printf("\n");
+  if (wantFloat) return asBits(2.5f);
   return 123;
 }
 
@@ -176,6 +177,18 @@ class StructuralTests(unittest.TestCase):
         code, pool = gsc.compile_source_with_pool('x = cmd("GVER");')
         self.assertIn(gsc.OP_CMDCALL, code)
         self.assertEqual(pool, b"GVER\x00")
+
+    def test_cmdf_emits_cmdcallf_and_is_float_typed(self):
+        code, pool = gsc.compile_source_with_pool(
+            'x = cmdf("GVOLT"); y = x + 1.0;')
+        self.assertIn(gsc.OP_CMDCALLF, code)
+        self.assertNotIn(gsc.OP_CMDCALL, code[:1])
+        self.assertIn(gsc.OP_FADD, code)  # no int->float promotion needed
+        self.assertNotIn(gsc.OP_I2F, code)
+
+    def test_cmd_result_assigned_to_float_var_promotes(self):
+        code, pool = gsc.compile_source_with_pool('var x: float; x = cmd("GVER");')
+        self.assertIn(gsc.OP_I2F, code)
 
     def test_disassemble_shows_cmd_name_from_pool(self):
         code, pool = gsc.compile_source_with_pool('cmd("SADCPIN", 5);')
@@ -308,6 +321,14 @@ class EndToEndVmTests(unittest.TestCase):
         """)
         self.assertEqual(status, 1)
         self.assertEqual(lines, ["CMD:SADCPIN,5,6", "123"])
+
+    def test_cmdf_returns_float(self):
+        status, lines = self.run_script("""
+            syscall printf(v) = 1;
+            printf(cmdf("GVOLT", 3) + 1.0);
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["CMD:GVOLT,3", "F3.5"])
 
     def test_cmd_call_no_args_reaches_bridge(self):
         status, lines = self.run_script("""

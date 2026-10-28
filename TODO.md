@@ -29,12 +29,13 @@ the working list of what's still unresolved.
 - [ ] `cmd()`'s return value can't distinguish NAK from "ACK with value
       0" — both come back as `0`. A script that needs to know for sure
       has to know which commands it's calling and design around it.
-- [ ] `cmd()` response parsing is integer-only (`atoi` on the response
-      text after the ACK byte). A GET-style command whose value is a
-      float (e.g. `"3.14"`) comes back truncated at the decimal point
-      (`3`), not rounded or rejected. Getting real float values back
-      through `cmd()` would need a parsing convention this doesn't have
-      yet.
+- [x] ~~`cmd()` response parsing is integer-only~~ — `cmd()` still
+      returns an int (`atoi`), but `cmdf()` now returns the reply parsed
+      as a float32. The script picks which up front.
+- [ ] `cmd()`/`cmdf()` *arguments* are still formatted as integers
+      (`%d`): a float argument is sent as its raw bit pattern, not
+      `3.5`. Sending fractional values to a command needs the same
+      treatment (type-aware formatting in the bridge).
 - [ ] Neither syscalls nor `cmd()` type-check arguments — the compiler
       pushes whatever an expression evaluates to; the receiving syscall/
       command decides how to interpret it. A script can pass a float

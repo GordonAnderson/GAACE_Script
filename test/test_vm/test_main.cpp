@@ -355,7 +355,10 @@ static char lastBridgeName[32];
 static int32_t lastBridgeArgs[4];
 static uint8_t lastBridgeArgc;
 
-static int32_t fakeCmdBridge(const char *name, int32_t *args, uint8_t argc) {
+static bool lastBridgeWantFloat;
+
+static int32_t fakeCmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat) {
+  lastBridgeWantFloat = wantFloat;
   strncpy(lastBridgeName, name, sizeof(lastBridgeName) - 1);
   lastBridgeName[sizeof(lastBridgeName) - 1] = '\0';
   lastBridgeArgc = argc;
@@ -386,6 +389,23 @@ static void test_cmdcall_invokes_bridge_with_name_and_args(void) {
   TEST_ASSERT_EQUAL_INT32(5, lastBridgeArgs[0]);
   TEST_ASSERT_EQUAL_INT32(6, lastBridgeArgs[1]);
   TEST_ASSERT_EQUAL_INT32(99, vm.stack[vm.sp - 1]);
+}
+
+static void test_cmdcallf_asks_bridge_for_float(void) {
+  static const uint8_t pool[] = "GVOLT\0";
+  Asm a;
+  a.cmdCall(0, 0);
+  a.op(OP_HALT);
+  a.buf[0] = OP_CMDCALLF;  // swap the opcode byte; operands are identical
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetCmdBridge(vm, fakeCmdBridge);
+
+  lastBridgeWantFloat = false;
+  TEST_ASSERT_EQUAL(VM_HALTED, vmRun(vm, 100));
+  TEST_ASSERT_TRUE(lastBridgeWantFloat);
 }
 
 static void test_cmdcall_without_bridge_registered_errors(void) {
@@ -449,6 +469,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_float_div_by_zero_is_reported);
   RUN_TEST(test_power_to_drive_example);
   RUN_TEST(test_cmdcall_invokes_bridge_with_name_and_args);
+  RUN_TEST(test_cmdcallf_asks_bridge_for_float);
   RUN_TEST(test_cmdcall_without_bridge_registered_errors);
   RUN_TEST(test_cmdcall_offset_out_of_range_errors);
   RUN_TEST(test_cmdcall_missing_terminator_errors);

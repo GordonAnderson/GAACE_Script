@@ -22,7 +22,8 @@ namespace GAACEScript {
 //   OP_LOAD/STORE <slot>                 2 bytes total
 //   OP_JMP/JZ/JNZ <u16 abs>              3 bytes total (absolute, not relative)
 //   OP_CALL <id> <argc>                   3 bytes total
-//   OP_CMDCALL <poolOffset:u16> <argc>    4 bytes total
+//   OP_CMDCALL  <poolOffset:u16> <argc>   4 bytes total
+//   OP_CMDCALLF <poolOffset:u16> <argc>   4 bytes total (float-returning)
 //   everything else                      1 byte (no operand)
 //
 // Floats: a stack/variable slot is just 4 bytes with no type tag anywhere --
@@ -86,6 +87,7 @@ enum Opcode : uint8_t {
   OP_I2F,   // pop int32, push its float32 conversion
   OP_F2I,   // pop float32, push its int32 truncation (toward zero)
   OP_CMDCALL,
+  OP_CMDCALLF,  // same as CMDCALL, but asks the bridge for a float32 result
 };
 
 enum Status : uint8_t {
@@ -132,7 +134,13 @@ typedef int32_t (*SyscallFn)(int32_t *args, uint8_t argc);
 // (e.g. "SADCPIN"); args/argc are the script's arguments, same convention
 // as SyscallFn. Exactly one bridge per VM (not a table -- there's only ever
 // one "the command processor" to reach), registered with vmSetCmdBridge().
-typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc);
+//
+// `wantFloat` is true for OP_CMDCALLF (script wrote `cmdf(...)`): the bridge
+// must then return the response parsed as a float32, bit-cast into the
+// int32_t return (the same convention syscalls use for `: float`). For plain
+// CMDCALL it is false and the bridge returns an ordinary int32.
+typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc,
+                               bool wantFloat);
 
 struct VM {
   int32_t stack[STACK_SIZE];

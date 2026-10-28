@@ -77,16 +77,66 @@ script can call, with zero per-project wiring (`GAACEScriptRuntime.h`'s
   logic a real typed command uses, in complete isolation from whatever a
   human/PC might be mid-typing into the shared input buffer at that same
   moment.
-- Returns an `int`: the response parsed as a number on ACK, `0` on NAK or
-  if the response has no trailing number (e.g. a plain action command with
-  no return value). NAK and "ACK with value 0" aren't distinguishable from
-  the return value alone.
+- `cmd()` returns an `int`: the response parsed as a number on ACK, `0` on
+  NAK or if the response has no trailing number (e.g. a plain action
+  command with no return value). NAK and "ACK with value 0" aren't
+  distinguishable from the return value alone.
+- `cmdf("NAME", args...)` is identical but returns a `float`: the reply is
+  parsed as float32, so `"3.14"` comes back as `3.14` instead of `3`. Use
+  it for any command whose reply can be fractional (`volts = cmdf("GVOLT",
+  1);`). The script picks `cmd` vs `cmdf` up front because values carry no
+  runtime type tag; an int-returning `cmd()` assigned to a `float`
+  variable still auto-promotes as usual.
 - Arguments aren't type-checked (same as syscalls); floats can be passed,
   the receiving command decides how to interpret them.
 - A script that uses `cmd()` compiles to *two* artifacts — code and pool —
   see `--scriptload` below for the wire format that combines them for
   `SCRIPTLOAD`, or use `--format carray` to get both as separate arrays for
   hand-written `vmInit()`/`vmSetPool()` calls.
+
+### The string pool: how `cmd()`/`cmdf()` carry command names
+
+Bytecode can only hold 4-byte numbers, so a command name like `"SADCPIN"`
+can't live in the instruction stream. The compiler splits a script into two
+blobs: the **code**, and a **pool** of NUL-terminated name strings. Each
+command call in the code is `CMDCALL <poolOffset:u16> <argc>` (`CMDCALLF`
+for `cmdf()`), where `poolOffset` is the byte offset of its name in the pool.
+
+For `cmd("SADCPIN", 5); cmd("GVER");`:
+
+```
+code:   PUSH_I32 5
+        CMDCALL  offset=0 argc=1      <- "SADCPIN"
+        CMDCALL  offset=8 argc=0      <- "GVER"
+
+pool:   S A D C P I N \0 G V E R \0
+        0 1 2 3 4 5 6 7  8 9 10 11 12
+```
+
+A name used more than once is stored once; every call shares its offset.
+
+At runtime the VM pops the arguments, finds the name at `poolOffset` (a
+bounds-checked scan for the terminating NUL — an offset past the end or a
+missing terminator stops the script with `VM_ERR_BAD_POOL`), and hands
+`(name, args, argc)` to the bridge, which builds `NAME,arg0,arg1` and runs it
+through `executeLine()`. `cmd()` and `cmdf()` use the pool identically; they
+differ only in how the bridge parses the reply (int vs float32).
+
+What this means in practice:
+
+- **The pool must be loaded together with the code.** `--upload` and
+  `--scriptload` do this (`[codeLen:u16][code][pool]`). Plain `-o` /
+  `--format hex` write the code only and warn that the pool was dropped;
+  loaded that way, every `cmd()`/`cmdf()` call fails.
+- **The pool counts toward the per-slot size limit** along with the length
+  prefix and the code (`GAACE_SCRIPT_MAX_CODE_LEN`, see README.md). A script
+  that calls many *different* commands spends more of that budget; repeated
+  calls to the same command cost nothing extra.
+- **Each slot has its own pool.** `SCRIPTLOAD` always sets it, even for a
+  script with no pool, so a reloaded slot can't keep pointing at the
+  previous script's strings.
+- `--disasm` reads the pool to show `CMDCALL "SADCPIN"` rather than a bare
+  offset.
 
 ## Usage
 
