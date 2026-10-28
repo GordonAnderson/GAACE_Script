@@ -61,6 +61,18 @@ Notes:
   - An expression used as a statement (e.g. a bare call for its side effect)
     has its return value discarded (compiled as <expr> POP).
 
+Syscall tables (scripts without declarations):
+  - If the firmware registers its syscalls with ScriptRuntime::registerSyscalls()
+    the device can describe them (GSYSCALLS). `--upload` asks it; `--syscalls
+    FILE` reads a saved copy (`--save-syscalls` / `--list-syscalls` make one).
+    Compiling against a table, any syscall in it can be called with no
+    `syscall NAME(...) = ID;` line -- id, argument count and return type come
+    from the firmware. An explicit declaration must agree with the table or
+    it's a compile error; a call to a name the table lacks is one too.
+  - `--upload` stamps the table's hash on SCRIPTLOAD/SCRIPTCOMMIT (only when
+    the script calls a syscall), and the device NAKs a mismatch. See
+    tools/README.md.
+
 Floats:
   - Literals need a decimal point (`3.5`, `0.0`) — `3` is always `int`.
   - `+ - * /` promote automatically: int paired with float produces float
@@ -105,6 +117,7 @@ a running controller's control port via SCRIPTLOAD (see WORKFLOW.md).
 import argparse
 import re
 import struct
+import json
 import sys
 import time
 
@@ -175,6 +188,128 @@ LOGIC_OPS = {"&&", "||"}
 
 class CompileError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Syscall tables
+#
+# A firmware that registers its syscalls with ScriptRuntime::registerSyscalls()
+# can describe them to the host (the GSYSCALLS command, or a JSON file saved
+# from it). Compiling against such a table means a script can just call
+# `read_adc()` with no `syscall ...;` declaration, and the compiler knows each
+# syscall's id, argument count and return type from the firmware itself.
+# ---------------------------------------------------------------------------
+class SyscallTableError(Exception):
+    pass
+
+
+def syscall_table_hash(entries):
+    """FNV-1a (32-bit) over "name:argc:i|f;" per entry, in order. MUST match
+    syscallTableHash() in src/GAACEScript.cpp (both are pinned to a shared test
+    vector). Never 0 -- 0 means "unchecked" wherever a hash is optional."""
+    h = 0x811C9DC5
+    for name, argc, returns in entries:
+        text = f"{name}:{argc}:{'f' if returns == 'float' else 'i'};"
+        for b in text.encode("ascii"):
+            h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h or 1
+
+
+class SyscallTable:
+    """An ordered list of (name, argc, returns); a syscall's id is its index.
+    `returns` is "int" or "float"."""
+
+    def __init__(self, entries):
+        self.entries = [(n, int(a), r) for n, a, r in entries]
+        seen = set()
+        for name, argc, returns in self.entries:
+            if returns not in ("int", "float"):
+                raise SyscallTableError(f"syscall '{name}': return type must be 'int' or 'float', not {returns!r}")
+            if name in seen:
+                raise SyscallTableError(f"syscall '{name}' appears twice in the table")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise SyscallTableError(f"syscall name {name!r} is not a valid identifier")
+            seen.add(name)
+
+    @property
+    def hash(self):
+        return syscall_table_hash(self.entries)
+
+    def lookup(self):
+        """name -> (id, argc, return_type), the shape Codegen uses."""
+        return {n: (i, a, r) for i, (n, a, r) in enumerate(self.entries)}
+
+    def signature(self, i):
+        name, argc, returns = self.entries[i]
+        args = ", ".join(f"a{k}" for k in range(argc))
+        return f"{returns} {name}({args})"
+
+    def to_json(self):
+        return json.dumps({
+            "hash": f"{self.hash:08X}",
+            "syscalls": [{"name": n, "argc": a, "returns": r} for n, a, r in self.entries],
+        }, indent=2) + "\n"
+
+    @classmethod
+    def from_json(cls, text):
+        try:
+            data = json.loads(text)
+            table = cls((e["name"], e["argc"], e.get("returns", "int")) for e in data["syscalls"])
+        except (ValueError, KeyError, TypeError) as e:
+            raise SyscallTableError(f"not a valid syscall table file: {e}")
+        stated = data.get("hash")
+        if stated is not None and stated.upper() != f"{table.hash:08X}":
+            raise SyscallTableError(
+                f"syscall table file is inconsistent: its hash says {stated} but its "
+                f"entries hash to {table.hash:08X} (hand-edited? re-save it from the device)")
+        return table
+
+
+def query_syscall_table(ser):
+    """Asks a connected device for its syscall table (GSYSCALLS) over the open
+    serial port `ser`. Returns (table, None), or (None, reason) if the device
+    simply doesn't offer one (no response, or NAK: firmware without a table).
+    Raises SyscallTableError for a reply that's there but malformed -- that's a
+    real problem, not "unsupported"."""
+    ser.reset_input_buffer()
+    ser.write(b"GSYSCALLS\n")
+
+    header = None
+    for _ in range(4):  # tolerate an echoed command line before the ACK
+        line = ser.read_until(b"\n")
+        if not line:
+            return None, "no response"
+        if b"\x15" in line:
+            return None, "the device NAKed GSYSCALLS"
+        if b"\x06" in line:
+            header = line.split(b"\x06", 1)[1].strip().decode("ascii", "replace")
+            break
+    if header is None:
+        return None, "no ACK in the response"
+
+    try:
+        count_text, hash_text = header.split(",")
+        count, reported = int(count_text), int(hash_text, 16)
+    except ValueError:
+        raise SyscallTableError(f"unrecognised GSYSCALLS header: {header!r}")
+
+    entries = []
+    for i in range(count):
+        line = ser.read_until(b"\n").strip().decode("ascii", "replace")
+        parts = line.split(",")
+        if len(parts) != 4 or parts[0] != str(i) or parts[3] not in ("int", "float"):
+            raise SyscallTableError(f"unrecognised GSYSCALLS line {i}: {line!r}")
+        try:
+            entries.append((parts[1], int(parts[2]), parts[3]))
+        except ValueError:
+            raise SyscallTableError(f"unrecognised GSYSCALLS line {i}: {line!r}")
+
+    table = SyscallTable(entries)
+    if table.hash != reported:
+        raise SyscallTableError(
+            f"device reported table hash {reported:08X} but its entries hash to "
+            f"{table.hash:08X} (mismatched gsc.py/firmware hash definition?)")
+    return table, None
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +627,10 @@ class Parser:
 # Codegen
 # ---------------------------------------------------------------------------
 class Codegen:
-    def __init__(self, syscalls):
+    def __init__(self, syscalls, from_table=False):
         self.syscalls = syscalls  # name -> (id, argc, return_type)
+        self.from_table = from_table  # syscalls came from a device/file table
+        self.used_syscalls = set()    # names actually called by the script
         self.buf = bytearray()
         self.vars = {}            # name -> slot
         self.var_types = {}       # name -> "int" | "float"
@@ -726,7 +863,15 @@ class Codegen:
 
         if isinstance(expr, Call):
             if expr.name not in self.syscalls:
-                raise CompileError(f"call to undeclared syscall '{expr.name}'")
+                if self.from_table:
+                    avail = ", ".join(sorted(self.syscalls)) or "(none)"
+                    raise CompileError(
+                        f"'{expr.name}' is not a syscall on this device (it offers: {avail})")
+                raise CompileError(
+                    f"call to undeclared syscall '{expr.name}' -- declare it with "
+                    f"`syscall {expr.name}(...) = ID;`, or compile against the device's "
+                    f"syscall table (--upload queries it; or --syscalls FILE)")
+            self.used_syscalls.add(expr.name)
             id_, argc, return_type = self.syscalls[expr.name]
             if len(expr.args) != argc:
                 raise CompileError(
@@ -754,20 +899,57 @@ class Codegen:
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
 
-def compile_source_with_pool(src):
+class CompiledScript:
+    """Result of compile_script(): the code, the cmd() string pool, and whether
+    the script calls any syscalls (if it doesn't, the syscall-table hash is
+    irrelevant to it and isn't stamped on upload)."""
+
+    def __init__(self, code, pool, uses_syscalls):
+        self.code, self.pool, self.uses_syscalls = code, pool, uses_syscalls
+
+
+def compile_script(src, syscall_table=None):
+    """Compiles `src`. With a `syscall_table` (a SyscallTable from the device
+    or a saved file), every syscall in it is callable without a declaration,
+    and any explicit `syscall NAME(...) = ID;` declaration must agree with it
+    -- a disagreement (wrong id, argument count, return type, or a name the
+    table doesn't have) is a compile error rather than a script that
+    silently calls the wrong function."""
+    tokens = tokenize(src)
+    decls, program = Parser(tokens).parse_program()
+
+    syscalls = syscall_table.lookup() if syscall_table else {}
+    declared = set()
+    for d in decls:
+        if d.name in declared:
+            raise CompileError(f"syscall '{d.name}' declared more than once")
+        declared.add(d.name)
+        decl = (d.id, len(d.params), d.return_type)
+        if syscall_table:
+            actual = syscalls.get(d.name)
+            if actual is None:
+                raise CompileError(
+                    f"syscall '{d.name}' is declared but the device has no such syscall "
+                    f"(it offers: {', '.join(sorted(syscalls)) or '(none)'})")
+            if decl != actual:
+                raise CompileError(
+                    f"syscall '{d.name}' is declared as id {decl[0]}, {decl[1]} arg(s), "
+                    f"returns {decl[2]}, but the device has id {actual[0]}, {actual[1]} "
+                    f"arg(s), returns {actual[2]} -- delete the declaration to use the "
+                    f"device's own")
+        else:
+            syscalls[d.name] = decl
+    codegen = Codegen(syscalls, from_table=bool(syscall_table))
+    code = codegen.gen_program(program)
+    return CompiledScript(code, bytes(codegen.pool), bool(codegen.used_syscalls))
+
+
+def compile_source_with_pool(src, syscall_table=None):
     """Returns (code, pool). `pool` is the string-constant table cmd() calls
     reference (empty bytes if the script never uses cmd()) -- see gsc.py's
     module docstring and tools/README.md for what to do with it."""
-    tokens = tokenize(src)
-    decls, program = Parser(tokens).parse_program()
-    syscalls = {}
-    for d in decls:
-        if d.name in syscalls:
-            raise CompileError(f"syscall '{d.name}' declared more than once")
-        syscalls[d.name] = (d.id, len(d.params), d.return_type)
-    codegen = Codegen(syscalls)
-    code = codegen.gen_program(program)
-    return code, bytes(codegen.pool)
+    result = compile_script(src, syscall_table)
+    return result.code, result.pool
 
 
 def compile_source(src):
@@ -847,7 +1029,9 @@ def disassemble(code: bytes, pool: bytes = b"") -> str:
 # ---------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(description="GAACE_Script compiler")
-    ap.add_argument("source", help="path to .gs source file, or '-' for stdin")
+    ap.add_argument("source", nargs="?",
+                     help="path to .gs source file, or '-' for stdin (not needed with "
+                          "--list-syscalls)")
     ap.add_argument("-o", "--output", help="output file (default: stdout for hex/carray, "
                                             "<source>.bin for bin)")
     ap.add_argument("--format", choices=["bin", "hex", "carray"], default="bin")
@@ -875,29 +1059,56 @@ def main(argv=None):
                           "Keep well under ~250 -- see GAACEScriptRuntime.h for why that's the "
                           "real ceiling (commandProcessor's shared 512-byte scratch arena), "
                           "regardless of GAACE_SCRIPT_MAX_CODE_LEN.")
+    ap.add_argument("--syscalls", metavar="FILE",
+                     help="compile against this saved syscall table (JSON, from "
+                          "--save-syscalls) instead of asking a device: syscalls in it "
+                          "need no declaration, and any declaration in the script must "
+                          "agree with it. With --upload this replaces the device query; "
+                          "the device then verifies the table's hash at load time.")
+    ap.add_argument("--list-syscalls", metavar="PORT",
+                     help="ask the controller on PORT for its syscall table, print it, and "
+                          "exit (no source file needed). Add --save-syscalls to keep it.")
+    ap.add_argument("--save-syscalls", metavar="FILE",
+                     help="with --upload or --list-syscalls: write the table the device "
+                          "reported to FILE (JSON) for later offline use with --syscalls")
+    ap.add_argument("--no-device-syscalls", action="store_true",
+                     help="with --upload: don't ask the device for its syscall table; the "
+                          "script must declare every syscall it uses, as in older versions")
     args = ap.parse_args(argv)
+
+    if args.list_syscalls:
+        return list_syscalls(args)
+    if args.source is None:
+        ap.error("a source file is required (or use --list-syscalls PORT)")
 
     src = sys.stdin.read() if args.source == "-" else open(args.source).read()
 
+    if args.upload:
+        return compile_and_upload(args, src)
+
+    table = None
+    if args.syscalls:
+        try:
+            table = load_syscall_table_file(args.syscalls)
+        except (OSError, SyscallTableError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+
     try:
-        code, pool = compile_source_with_pool(src)
+        compiled = compile_script(src, table)
     except CompileError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    code, pool = compiled.code, compiled.pool
 
     if args.disasm:
         print(disassemble(code, pool))
-        if not args.upload:
-            return 0
+        return 0
 
-    if args.upload:
-        if args.slot is None:
-            print("error: --upload requires --slot", file=sys.stderr)
-            return 1
-        payload = build_scriptload_payload(code, pool)
-        return upload_script(args.upload, args.slot, payload.hex(),
-                              baud=args.baud, timeout=args.timeout,
-                              chunk_bytes=args.chunk_bytes)
+    if table is not None and compiled.uses_syscalls and (args.scriptload or args.format == "carray"):
+        print(f"note: compiled against a syscall table with hash {table.hash:08X}; append "
+              f"it as the optional last argument of SCRIPTLOAD/SCRIPTCOMMIT so the device "
+              f"can reject the script if its syscalls differ", file=sys.stderr)
 
     if args.scriptload:
         payload = build_scriptload_payload(code, pool)
@@ -918,7 +1129,8 @@ def main(argv=None):
     return 0
 
 
-def upload_script(port, slot, payload_hex, baud=115200, timeout=3.0, chunk_bytes=200):
+def upload_script(port, slot, payload_hex, baud=115200, timeout=3.0, chunk_bytes=200,
+                  syscall_hash=None):
     """Sends a compiled script to `port` and reports the result.
 
     A payload that fits in `chunk_bytes` or fewer decoded bytes goes via a
@@ -931,20 +1143,40 @@ def upload_script(port, slot, payload_hex, baud=115200, timeout=3.0, chunk_bytes
     raised to help: each chunk individually stays well under that arena
     regardless of how large the total script or the slot's buffer are.
 
+    `syscall_hash` (an int from SyscallTable.hash) is appended as the optional
+    last argument of SCRIPTLOAD/SCRIPTCOMMIT, so the device can refuse a
+    script compiled against a different syscall table than its own.
+
     Returns a process exit code (0 on success, 1 otherwise) so this
     composes with shell scripting.
     """
+    ser = _open_port(port, baud, timeout)
+    if ser is None:
+        return 1
+    with ser:
+        time.sleep(0.2)  # let the connection settle before writing
+        return _upload_on(ser, slot, payload_hex, timeout, chunk_bytes, syscall_hash)
+
+
+def _open_port(port, baud, timeout):
+    """Opens `port` with pyserial; prints the reason and returns None on failure."""
     try:
         import serial
     except ImportError:
         print("error: --upload requires pyserial -- pip install pyserial", file=sys.stderr)
-        return 1
+        return None
 
     try:
-        ser = serial.Serial(port, baud, timeout=timeout)
+        return serial.Serial(port, baud, timeout=timeout)
     except serial.SerialException as e:
         print(f"error: could not open {port}: {e}", file=sys.stderr)
-        return 1
+        return None
+
+
+def _upload_on(ser, slot, payload_hex, timeout, chunk_bytes, syscall_hash=None):
+    """The SCRIPTLOAD / SCRIPTAPPEND+SCRIPTCOMMIT exchange on an already-open
+    port (see upload_script() for the protocol)."""
+    hash_arg = f",{syscall_hash:08X}" if syscall_hash else ""
 
     def send(line):
         ser.reset_input_buffer()
@@ -957,43 +1189,132 @@ def upload_script(port, slot, payload_hex, baud=115200, timeout=3.0, chunk_bytes
                   f"(wrong port/baud, or the control port isn't the one you opened?)",
                   file=sys.stderr)
         elif response[0] == 0x15:
-            print(f"NAK: device rejected {step} (bad slot/offset, malformed hex, or "
-                  f"over the configured size limit -- see GSCRIPTLIMITS)", file=sys.stderr)
+            print(f"NAK: device rejected {step} (bad slot/offset, malformed hex, over the "
+                  f"configured size limit -- see GSCRIPTLIMITS -- or, if a syscall table "
+                  f"hash was sent, the firmware's syscalls differ from the ones this "
+                  f"script was compiled against: re-run without --syscalls, or re-save "
+                  f"the table with --list-syscalls ... --save-syscalls)", file=sys.stderr)
         else:
             print(f"warning: unexpected response from device after {step}: "
                   f"{response!r}", file=sys.stderr)
 
+    total_len = len(payload_hex) // 2
+
+    if total_len <= chunk_bytes:
+        response = send(f"SCRIPTLOAD,{slot},{payload_hex}{hash_arg}")
+        if not response or response[0] != 0x06:
+            report_failure("SCRIPTLOAD", response)
+            return 1
+        print(f"OK: script loaded into slot {slot} ({total_len} bytes, single SCRIPTLOAD)")
+        return 0
+
+    chunk_count = 0
+    offset = 0
+    while offset < total_len:
+        chunk_hex = payload_hex[offset * 2: (offset + chunk_bytes) * 2]
+        response = send(f"SCRIPTAPPEND,{slot},{offset},{chunk_hex}")
+        if not response or response[0] != 0x06:
+            report_failure(f"SCRIPTAPPEND at offset {offset}", response)
+            return 1
+        offset += chunk_bytes
+        chunk_count += 1
+
+    response = send(f"SCRIPTCOMMIT,{slot},{total_len}{hash_arg}")
+    if not response or response[0] != 0x06:
+        report_failure("SCRIPTCOMMIT", response)
+        return 1
+
+    print(f"OK: script loaded into slot {slot} ({total_len} bytes, "
+          f"{chunk_count} SCRIPTAPPEND chunks + SCRIPTCOMMIT)")
+    return 0
+
+
+def load_syscall_table_file(path):
+    with open(path) as f:
+        return SyscallTable.from_json(f.read())
+
+
+def _device_table(ser, args):
+    """The syscall table to compile against for an --upload on open port `ser`:
+    from --syscalls FILE, else asked of the device, else None (the script then
+    has to declare its own syscalls). Prints what it did. Raises
+    SyscallTableError for an unusable file or malformed device reply."""
+    if args.syscalls:
+        return load_syscall_table_file(args.syscalls)
+    if args.no_device_syscalls:
+        return None
+    table, reason = query_syscall_table(ser)
+    if table is None:
+        print(f"note: no syscall table from the device ({reason}); the script must declare "
+              f"its own syscalls, and the load is not checked against the firmware's",
+              file=sys.stderr)
+        return None
+    print(f"syscall table from device: {len(table.entries)} syscalls, hash {table.hash:08X}")
+    if args.save_syscalls:
+        with open(args.save_syscalls, "w") as f:
+            f.write(table.to_json())
+        print(f"saved to {args.save_syscalls}")
+    return table
+
+
+def compile_and_upload(args, src):
+    """--upload: connect, learn the device's syscall table, compile against it,
+    and send the result stamped with the table's hash."""
+    if args.slot is None:
+        print("error: --upload requires --slot", file=sys.stderr)
+        return 1
+    ser = _open_port(args.upload, args.baud, args.timeout)
+    if ser is None:
+        return 1
     with ser:
         time.sleep(0.2)  # let the connection settle before writing
-        total_len = len(payload_hex) // 2
-
-        if total_len <= chunk_bytes:
-            response = send(f"SCRIPTLOAD,{slot},{payload_hex}")
-            if not response or response[0] != 0x06:
-                report_failure("SCRIPTLOAD", response)
-                return 1
-            print(f"OK: script loaded into slot {slot} ({total_len} bytes, single SCRIPTLOAD)")
-            return 0
-
-        chunk_count = 0
-        offset = 0
-        while offset < total_len:
-            chunk_hex = payload_hex[offset * 2: (offset + chunk_bytes) * 2]
-            response = send(f"SCRIPTAPPEND,{slot},{offset},{chunk_hex}")
-            if not response or response[0] != 0x06:
-                report_failure(f"SCRIPTAPPEND at offset {offset}", response)
-                return 1
-            offset += chunk_bytes
-            chunk_count += 1
-
-        response = send(f"SCRIPTCOMMIT,{slot},{total_len}")
-        if not response or response[0] != 0x06:
-            report_failure("SCRIPTCOMMIT", response)
+        try:
+            table = _device_table(ser, args)
+        except (OSError, SyscallTableError) as e:
+            print(f"error: {e}", file=sys.stderr)
             return 1
 
-        print(f"OK: script loaded into slot {slot} ({total_len} bytes, "
-              f"{chunk_count} SCRIPTAPPEND chunks + SCRIPTCOMMIT)")
-        return 0
+        try:
+            compiled = compile_script(src, table)
+        except CompileError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if args.disasm:
+            print(disassemble(compiled.code, compiled.pool))
+
+        payload = build_scriptload_payload(compiled.code, compiled.pool)
+        # Only a script that actually calls syscalls depends on the table, so
+        # only those are stamped (and refused after a mismatching firmware
+        # update); a cmd()-only script keeps working across syscall changes.
+        stamp = table.hash if (table is not None and compiled.uses_syscalls) else None
+        return _upload_on(ser, args.slot, payload.hex(), args.timeout,
+                          args.chunk_bytes, stamp)
+
+
+def list_syscalls(args):
+    """--list-syscalls PORT: print the device's syscall table."""
+    ser = _open_port(args.list_syscalls, args.baud, args.timeout)
+    if ser is None:
+        return 1
+    with ser:
+        time.sleep(0.2)
+        try:
+            table, reason = query_syscall_table(ser)
+        except SyscallTableError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    if table is None:
+        print(f"error: the device offers no syscall table ({reason}) -- its firmware may "
+              f"predate GSYSCALLS or never called registerSyscalls()", file=sys.stderr)
+        return 1
+    print(f"{len(table.entries)} syscalls, table hash {table.hash:08X}")
+    for i in range(len(table.entries)):
+        print(f"  {i}: {table.signature(i)}")
+    if args.save_syscalls:
+        with open(args.save_syscalls, "w") as f:
+            f.write(table.to_json())
+        print(f"saved to {args.save_syscalls}")
+    return 0
 
 
 def _emit(payload, args, name_suffix):

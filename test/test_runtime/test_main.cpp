@@ -196,6 +196,154 @@ static void test_scriptload_with_pool_end_to_end(void) {
   TEST_ASSERT_EQUAL(42, testValue);  // the loaded script's cmd("SFOO", 42) ran
 }
 
+// -----------------------------------------------------------------------
+// Syscall table: registerSyscalls() / GSYSCALLS / the optional <hash> on
+// SCRIPTLOAD. Real commandProcessor dispatch, real ACK/NAK bytes.
+// -----------------------------------------------------------------------
+static int32_t dummySyscall(int32_t *args, uint8_t argc) { return 0; }
+
+static const SyscallDesc testSyscalls[] = {
+  {"read_adc",  dummySyscall, 0, false},
+  {"get_volts", dummySyscall, 1, true},
+};
+
+static void sendLine(commandProcessor &cp, MockStream &ms, const char *line) {
+  for (const char *p = line; *p; p++) cp.rb->put(*p);
+  cp.rb->put('\n');
+  ms.reset();
+  cp.processCommands();
+}
+
+static void test_register_syscalls_rules(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+
+  TEST_ASSERT_EQUAL_UINT32(0, scripts.syscallHash());          // no table yet
+  TEST_ASSERT_TRUE(scripts.registerSyscalls(testSyscalls, 2));
+  TEST_ASSERT_EQUAL_UINT32(syscallTableHash(testSyscalls, 2), scripts.syscallHash());
+  TEST_ASSERT_EQUAL(2, scripts.slots[0].vm.syscallCount);
+  TEST_ASSERT_EQUAL(2, scripts.slots[SCRIPT_SLOTS - 1].vm.syscallCount);  // every slot
+  TEST_ASSERT_FALSE(scripts.registerSyscalls(testSyscalls, 2)); // only once
+}
+
+static void test_register_syscalls_refused_after_legacy_registration(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+
+  scripts.registerSyscall(dummySyscall);                        // legacy, id 0
+  TEST_ASSERT_FALSE(scripts.registerSyscalls(testSyscalls, 2)); // ids would not start at 0
+  TEST_ASSERT_EQUAL_UINT32(0, scripts.syscallHash());
+}
+
+static void test_gsyscalls_reports_the_table(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+  MockStream ms;
+  cp.registerStream(&ms);
+  cp.registerCommands(scripts.scriptCmdList());
+  scripts.registerSyscalls(testSyscalls, 2);
+
+  sendLine(cp, ms, "GSYSCALLS");
+
+  char expect[96];
+  snprintf(expect, sizeof(expect), "2,%08lX", (unsigned long)scripts.syscallHash());
+  TEST_ASSERT_EQUAL(0x06, ms.buf[0]);
+  TEST_ASSERT_NOT_NULL(strstr((char *)ms.buf + 1, expect));
+  TEST_ASSERT_NOT_NULL(strstr((char *)ms.buf, "0,read_adc,0,int"));
+  TEST_ASSERT_NOT_NULL(strstr((char *)ms.buf, "1,get_volts,1,float"));
+}
+
+static void test_gsyscalls_naks_without_a_table(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+  MockStream ms;
+  cp.registerStream(&ms);
+  cp.registerCommands(scripts.scriptCmdList());
+
+  sendLine(cp, ms, "GSYSCALLS");
+  TEST_ASSERT_EQUAL(0x15, ms.buf[0]);
+}
+
+static void test_scriptload_hash_accepted_rejected_and_remembered(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+  MockStream ms;
+  cp.registerStream(&ms);
+  cp.registerCommands(scripts.scriptCmdList());
+  scripts.registerSyscalls(testSyscalls, 2);
+
+  const char *payload = "0b00012a00000027000001030053464f4f00";   // see the test above
+  char line[160];
+
+  // matching hash: loads, and the slot remembers it
+  snprintf(line, sizeof(line), "SCRIPTLOAD,0,%s,%08lX", payload, (unsigned long)scripts.syscallHash());
+  sendLine(cp, ms, line);
+  TEST_ASSERT_EQUAL(0x06, ms.buf[0]);
+  TEST_ASSERT_TRUE(scripts.slots[0].loaded);
+  TEST_ASSERT_EQUAL_UINT32(scripts.syscallHash(), scripts.slots[0].syscallHash);
+
+  // no hash: loads unchecked, and clears the remembered one
+  snprintf(line, sizeof(line), "SCRIPTLOAD,1,%s", payload);
+  sendLine(cp, ms, line);
+  TEST_ASSERT_EQUAL(0x06, ms.buf[0]);
+  TEST_ASSERT_EQUAL_UINT32(0, scripts.slots[1].syscallHash);
+
+  // wrong hash: NAK, and the slot it targeted is not marked loaded
+  snprintf(line, sizeof(line), "SCRIPTLOAD,2,%s,%08lX", payload,
+           (unsigned long)(scripts.syscallHash() ^ 1u));
+  sendLine(cp, ms, line);
+  TEST_ASSERT_EQUAL(0x15, ms.buf[0]);
+  TEST_ASSERT_FALSE(scripts.slots[2].loaded);
+
+  // malformed hash: NAK
+  snprintf(line, sizeof(line), "SCRIPTLOAD,2,%s,notahash", payload);
+  sendLine(cp, ms, line);
+  TEST_ASSERT_EQUAL(0x15, ms.buf[0]);
+  TEST_ASSERT_FALSE(scripts.slots[2].loaded);
+}
+
+static void test_scriptload_hash_naks_when_no_table_registered(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+  MockStream ms;
+  cp.registerStream(&ms);
+  cp.registerCommands(scripts.scriptCmdList());
+
+  sendLine(cp, ms, "SCRIPTLOAD,0,0b00012a00000027000001030053464f4f00,892E7C6F");
+  TEST_ASSERT_EQUAL(0x15, ms.buf[0]);   // nothing to check the hash against
+  TEST_ASSERT_FALSE(scripts.slots[0].loaded);
+}
+
+static void test_scriptcommit_checks_the_hash_too(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+  MockStream ms;
+  cp.registerStream(&ms);
+  cp.registerCommands(scripts.scriptCmdList());
+  scripts.registerSyscalls(testSyscalls, 2);
+
+  sendLine(cp, ms, "SCRIPTAPPEND,0,0,0b00012a00000027000001030053464f4f00");
+  TEST_ASSERT_EQUAL(0x06, ms.buf[0]);
+
+  char line[64];
+  snprintf(line, sizeof(line), "SCRIPTCOMMIT,0,18,%08lX", (unsigned long)(scripts.syscallHash() ^ 1u));
+  sendLine(cp, ms, line);
+  TEST_ASSERT_EQUAL(0x15, ms.buf[0]);
+  TEST_ASSERT_FALSE(scripts.slots[0].loaded);
+
+  snprintf(line, sizeof(line), "SCRIPTCOMMIT,0,18,%08lX", (unsigned long)scripts.syscallHash());
+  sendLine(cp, ms, line);
+  TEST_ASSERT_EQUAL(0x06, ms.buf[0]);
+  TEST_ASSERT_TRUE(scripts.slots[0].loaded);
+}
+
 void setup() {
   delay(2000);
   UNITY_BEGIN();
@@ -203,6 +351,13 @@ void setup() {
   RUN_TEST(test_cmd_get_returns_parsed_value);
   RUN_TEST(test_cmd_unknown_command_returns_zero);
   RUN_TEST(test_scriptload_with_pool_end_to_end);
+  RUN_TEST(test_register_syscalls_rules);
+  RUN_TEST(test_register_syscalls_refused_after_legacy_registration);
+  RUN_TEST(test_gsyscalls_reports_the_table);
+  RUN_TEST(test_gsyscalls_naks_without_a_table);
+  RUN_TEST(test_scriptload_hash_accepted_rejected_and_remembered);
+  RUN_TEST(test_scriptload_hash_naks_when_no_table_registered);
+  RUN_TEST(test_scriptcommit_checks_the_hash_too);
   UNITY_END();
 }
 

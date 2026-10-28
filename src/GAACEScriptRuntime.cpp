@@ -4,7 +4,8 @@
 #include "GAACEScriptHex.h"
 #include <Errors.h>
 #include <stdio.h>
-#include <stdlib.h>  // atoi()
+#include <stdlib.h>  // atoi(), strtoul()
+#include <string.h>  // memcpy(), strlen()
 
 namespace GAACEScript {
 
@@ -77,18 +78,63 @@ uint8_t ScriptRuntime::registerSyscall(SyscallFn fn) {
   return id;
 }
 
+bool ScriptRuntime::registerSyscalls(const SyscallDesc *table, uint8_t count) {
+  if (table == nullptr || syscallTable_ != nullptr) return false;
+  if (count > MAX_SYSCALLS) return false;
+  if (slots[0].vm.syscallCount != 0) return false;   // ids must start at 0
+  for (uint8_t i = 0; i < count; i++) {
+    if (table[i].name == nullptr || table[i].fn == nullptr) return false;
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t s = 0; s < SCRIPT_SLOTS; s++) vmRegisterSyscall(slots[s].vm, table[i].fn);
+  }
+  syscallTable_ = table;
+  syscallCount_ = count;
+  syscallHash_  = syscallTableHash(table, count);
+  return true;
+}
+
+// Reads the optional trailing <hash> argument of SCRIPTLOAD/SCRIPTCOMMIT
+// (8 hex digits). `present` is whether the command line carries one; with
+// none, `hash` stays 0 (= unchecked) and this succeeds. Returns false (the
+// caller NAKs) for a malformed hash, or one that doesn't match this
+// firmware's registered table -- including any hash at all when no table
+// was registered, since then there is nothing to check it against.
+static bool readSyscallHash(bool present, uint32_t &hash) {
+  hash = 0;
+  if (!present) return true;
+
+  commandProcessor &cp = *activeInstance->cp_;
+  char *tok;
+  if (!cp.getValue(&tok)) return false;
+  char *end = nullptr;
+  unsigned long v = strtoul(tok, &end, 16);
+  bool wellFormed = (end != tok) && (*end == '\0') && strlen(tok) <= 8 && v != 0;
+  cp.ca->free(tok);
+
+  if (!wellFormed) return false;
+  if (activeInstance->syscallHash_ == 0 || (uint32_t)v != activeInstance->syscallHash_)
+    return false;
+  hash = (uint32_t)v;
+  return true;
+}
+
 // -----------------------------------------------------------------------
-// SCRIPTLOAD,<slot>,<hex> — decode <hex> into slots[slot].code and load it.
+// SCRIPTLOAD,<slot>,<hex>[,<hash>] — decode <hex> into slots[slot].code and load it.
 // <hex> carries [codeLen:u16 LE][code bytes][pool bytes] -- pool is
 // whatever's left after codeLen code bytes, empty for a script that
 // doesn't use cmd() (see gsc.py --scriptload, which produces exactly this
 // layout). NAKs (ERR_BADARG) on a bad slot index, malformed hex, a
 // decoded length over SCRIPT_MAX_CODE_LEN, or a codeLen prefix that
-// doesn't fit within what was actually decoded.
+// doesn't fit within what was actually decoded. The optional <hash> is
+// checked after the hex is decoded and freed (not held alongside it) so a
+// maximum-size hex argument still fits the 512-byte scratch arena.
 // -----------------------------------------------------------------------
 static void cmdScriptLoad(void) {
   commandProcessor &cp = *activeInstance->cp_;
-  if (!cp.checkExpectedArgs(2)) return;
+  int numArgs = cp.getNumArgs();
+  if (numArgs != 2 && numArgs != 3) { cp.sendNAK(ERR_BADARG); return; }
+  bool hasHash = (numArgs == 3);
 
   // NOT cp.getValue(&slot, 0, SCRIPT_SLOTS - 1): commandProcessor treats
   // ll == 0 && ul == 0 as "no range check" (see its getValue doc comment),
@@ -103,6 +149,10 @@ static void cmdScriptLoad(void) {
   if (!cp.getValue(&hex)) { cp.sendNAK(ERR_BADARG); return; }
 
   ScriptSlot &s = activeInstance->slots[slot];
+  // The decode below overwrites the slot's buffer, and a later check (layout,
+  // syscall hash) can still reject the load -- so, like SCRIPTAPPEND, a slot
+  // is not runnable from here until this load actually succeeds.
+  s.loaded = false;
   uint16_t decodedLen = 0;
   bool ok = hexDecode(hex, s.code, SCRIPT_MAX_CODE_LEN, decodedLen);
   cp.ca->free(hex);
@@ -113,11 +163,15 @@ static void cmdScriptLoad(void) {
   if (codeLen > decodedLen - 2) { cp.sendNAK(ERR_BADARG); return; }
   uint16_t poolLen = (uint16_t)(decodedLen - 2 - codeLen);
 
+  uint32_t hash;
+  if (!readSyscallHash(hasHash, hash)) { cp.sendNAK(ERR_BADARG); return; }
+
   s.codeLen = codeLen;
   vmInit(s.vm, s.code + 2, codeLen);
   // Always called, even for poolLen 0: a slot being reloaded with a script
   // that has no pool must not keep pointing at a previous script's pool.
   vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
+  s.syscallHash = hash;
   s.loaded = true;
   s.lastStatus = VM_OK;
   cp.sendACK();
@@ -180,7 +234,7 @@ static void cmdScriptAppend(void) {
 }
 
 // -----------------------------------------------------------------------
-// SCRIPTCOMMIT,<slot>,<totalLen> — finalize a buffer assembled via one or
+// SCRIPTCOMMIT,<slot>,<totalLen>[,<hash>] — finalize a buffer assembled via one or
 // more SCRIPTAPPEND calls: validates the [codeLen:u16][code][pool] layout
 // against <totalLen> exactly like SCRIPTLOAD does against its decoded
 // length, then vmInit()/vmSetPool() and marks the slot loaded. <totalLen>
@@ -189,7 +243,9 @@ static void cmdScriptAppend(void) {
 // -----------------------------------------------------------------------
 static void cmdScriptCommit(void) {
   commandProcessor &cp = *activeInstance->cp_;
-  if (!cp.checkExpectedArgs(2)) return;
+  int numArgs = cp.getNumArgs();
+  if (numArgs != 2 && numArgs != 3) { cp.sendNAK(ERR_BADARG); return; }
+  bool hasHash = (numArgs == 3);
 
   int slot;
   if (!cp.getValue(&slot) || slot < 0 || slot >= SCRIPT_SLOTS) {
@@ -209,10 +265,14 @@ static void cmdScriptCommit(void) {
   if (codeLen > (uint16_t)totalLen - 2) { cp.sendNAK(ERR_BADARG); return; }
   uint16_t poolLen = (uint16_t)((uint16_t)totalLen - 2 - codeLen);
 
+  uint32_t hash;
+  if (!readSyscallHash(hasHash, hash)) { cp.sendNAK(ERR_BADARG); return; }
+
   s.codeLen = codeLen;
   vmInit(s.vm, s.code + 2, codeLen);
   // Always called, even for poolLen 0 -- see cmdScriptLoad()'s identical note.
   vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
+  s.syscallHash = hash;
   s.loaded = true;
   s.lastStatus = VM_OK;
   cp.sendACK();
@@ -237,6 +297,34 @@ static void cmdScriptLimits(void) {
 }
 
 // -----------------------------------------------------------------------
+// GSYSCALLS — the registered syscall table: "count,hash" (hash as 8 hex
+// digits), then "index,name,argc,int|float" per syscall, one per line.
+// NAKs (ERR_CMD) if the project never called registerSyscalls().
+// -----------------------------------------------------------------------
+static void cmdSyscalls(void) {
+  commandProcessor &cp = *activeInstance->cp_;
+  if (!cp.checkExpectedArgs(0)) return;
+  if (activeInstance->syscallTable_ == nullptr) { cp.sendNAK(ERR_CMD); return; }
+
+  cp.sendACK(false);
+  char hashText[12];
+  snprintf(hashText, sizeof(hashText), "%08lX", (unsigned long)activeInstance->syscallHash_);
+  cp.print((int)activeInstance->syscallCount_);
+  cp.print(",");
+  cp.println(hashText);
+  for (uint8_t i = 0; i < activeInstance->syscallCount_; i++) {
+    const SyscallDesc &d = activeInstance->syscallTable_[i];
+    cp.print((int)i);
+    cp.print(",");
+    cp.print(d.name);
+    cp.print(",");
+    cp.print((int)d.argc);
+    cp.print(",");
+    cp.println(d.returnsFloat ? "float" : "int");
+  }
+}
+
+// -----------------------------------------------------------------------
 // GSCRIPTST,<slot> — loaded(0|1),lastStatus
 // -----------------------------------------------------------------------
 static void cmdScriptStatus(void) {
@@ -258,12 +346,14 @@ static void cmdScriptStatus(void) {
 }
 
 static Command scriptCmds[] = {
-  {"SCRIPTLOAD",   CMDfunction, 2, (void *)cmdScriptLoad,   NULL,
-   "SCRIPTLOAD,<slot>,<hex> -- load a compiled script into a slot"},
+  {"SCRIPTLOAD",   CMDfunction, -1, (void *)cmdScriptLoad,   NULL,
+   "SCRIPTLOAD,<slot>,<hex>[,<hash>] -- load a compiled script into a slot"},
   {"SCRIPTAPPEND", CMDfunction, 3, (void *)cmdScriptAppend, NULL,
    "SCRIPTAPPEND,<slot>,<offset>,<hexchunk> -- write a chunk into a slot's buffer"},
-  {"SCRIPTCOMMIT", CMDfunction, 2, (void *)cmdScriptCommit, NULL,
-   "SCRIPTCOMMIT,<slot>,<totalLen> -- finalize a buffer assembled via SCRIPTAPPEND"},
+  {"SCRIPTCOMMIT", CMDfunction, -1, (void *)cmdScriptCommit, NULL,
+   "SCRIPTCOMMIT,<slot>,<totalLen>[,<hash>] -- finalize a buffer assembled via SCRIPTAPPEND"},
+  {"GSYSCALLS",     CMDfunction, 0, (void *)cmdSyscalls,      NULL,
+   "count,hash then index,name,argc,int|float per syscall"},
   {"GSCRIPTLIMITS", CMDfunction, 0, (void *)cmdScriptLimits, NULL,
    "slots,maxCodeLen,stackSize,varSlots,maxSyscalls"},
   {"GSCRIPTST",     CMDfunction, 1, (void *)cmdScriptStatus, NULL,

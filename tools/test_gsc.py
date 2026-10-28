@@ -12,6 +12,7 @@ Two layers:
 
 Run with: python3 -m unittest tools/test_gsc.py -v
 """
+import io
 import os
 import shutil
 import subprocess
@@ -215,8 +216,8 @@ class EndToEndVmTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
-    def run_script(self, source, reps=1):
-        code, pool = gsc.compile_source_with_pool(source)
+    def run_script(self, source, reps=1, table=None):
+        code, pool = gsc.compile_source_with_pool(source, table)
         bin_path = os.path.join(self.tmpdir, "prog.bin")
         pool_path = os.path.join(self.tmpdir, "prog.pool.bin")
         with open(bin_path, "wb") as f:
@@ -330,6 +331,17 @@ class EndToEndVmTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(lines, ["CMD:GVOLT,3", "F3.5"])
 
+    def test_script_without_declarations_runs_against_a_table(self):
+        # The same five syscalls the harness registers, described as a device
+        # would report them -- the script declares none of them itself.
+        status, lines = self.run_script("""
+            watts = read_power();
+            if (watts > 100.0) { set_max_drive(max_drive() - 5.0); }
+            print(7);
+        """, table=HARNESS_TABLE)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["S75", "7"])
+
     def test_cmd_call_no_args_reaches_bridge(self):
         status, lines = self.run_script("""
             syscall print(v) = 0;
@@ -337,6 +349,101 @@ class EndToEndVmTests(unittest.TestCase):
         """)
         self.assertEqual(status, 1)
         self.assertEqual(lines, ["CMD:GVER", "123"])
+
+
+# The harness's fixed syscall set (ids 0..4) as a device's table would
+# describe it.
+HARNESS_TABLE = gsc.SyscallTable([
+    ("print", 1, "int"), ("printf", 1, "int"),
+    ("read_power", 0, "float"), ("max_drive", 0, "float"),
+    ("set_max_drive", 1, "int"),
+])
+
+# Table and expected hash pinned identically in test/test_vm/test_main.cpp.
+SHARED_VECTOR_TABLE = [("read_adc", 0, "int"), ("set_volts", 1, "int"), ("get_volts", 1, "float")]
+SHARED_VECTOR_HASH = 0x892E7C6F
+
+
+class SyscallTableTests(unittest.TestCase):
+    def test_hash_matches_shared_vector(self):
+        # If this fails, gsc.py and src/GAACEScript.cpp disagree on the hash.
+        self.assertEqual(gsc.syscall_table_hash(SHARED_VECTOR_TABLE), SHARED_VECTOR_HASH)
+
+    def test_hash_empty_table_and_multi_digit_argc(self):
+        self.assertEqual(gsc.syscall_table_hash([]), 0x811C9DC5)
+        self.assertEqual(gsc.syscall_table_hash([("wide", 10, "int")]), 0x87223431)
+
+    def test_hash_changes_with_any_difference(self):
+        base = [("a", 1, "int"), ("b", 0, "int")]
+        h = gsc.syscall_table_hash(base)
+        for other in ([("a", 1, "int"), ("c", 0, "int")],
+                      [("a", 2, "int"), ("b", 0, "int")],
+                      [("a", 1, "float"), ("b", 0, "int")],
+                      [("b", 0, "int"), ("a", 1, "int")],
+                      base[:1]):
+            self.assertNotEqual(h, gsc.syscall_table_hash(other))
+
+    def test_json_roundtrip(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        again = gsc.SyscallTable.from_json(table.to_json())
+        self.assertEqual(again.entries, table.entries)
+        self.assertEqual(again.hash, SHARED_VECTOR_HASH)
+
+    def test_json_with_edited_entries_is_rejected(self):
+        text = gsc.SyscallTable(SHARED_VECTOR_TABLE).to_json().replace("read_adc", "read_dac")
+        with self.assertRaises(gsc.SyscallTableError):
+            gsc.SyscallTable.from_json(text)
+
+    def test_duplicate_or_bad_entries_rejected(self):
+        with self.assertRaises(gsc.SyscallTableError):
+            gsc.SyscallTable([("a", 0, "int"), ("a", 1, "int")])
+        with self.assertRaises(gsc.SyscallTableError):
+            gsc.SyscallTable([("a", 0, "double")])
+        with self.assertRaises(gsc.SyscallTableError):
+            gsc.SyscallTable([("not valid", 0, "int")])
+
+    def test_calls_resolve_without_declarations(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        code, _ = gsc.compile_source_with_pool("x = get_volts(2) + 1.0; set_volts(3);", table)
+        # get_volts is id 2 (float) -> FADD with no int->float promotion of it
+        self.assertIn(gsc.OP_FADD, code)
+        self.assertIn(bytes([gsc.OP_CALL, 2, 1]), code)
+        self.assertIn(bytes([gsc.OP_CALL, 1, 1]), code)
+
+    def test_unknown_syscall_error_lists_what_the_device_has(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        with self.assertRaises(gsc.CompileError) as cm:
+            gsc.compile_source_with_pool("set_volt(3);", table)
+        self.assertIn("read_adc", str(cm.exception))
+        self.assertIn("not a syscall on this device", str(cm.exception))
+
+    def test_wrong_argument_count_against_table(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        with self.assertRaises(gsc.CompileError):
+            gsc.compile_source_with_pool("set_volts(1, 2);", table)
+
+    def test_agreeing_explicit_declaration_is_fine(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        gsc.compile_source_with_pool("syscall set_volts(v) = 1; set_volts(3);", table)
+
+    def test_disagreeing_explicit_declarations_are_errors(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        for decl in ("syscall set_volts(v) = 5;",              # wrong id
+                     "syscall set_volts(v, w) = 1;",           # wrong argc
+                     "syscall set_volts(v) : float = 1;",      # wrong return type
+                     "syscall bogus(v) = 9;"):                 # not in the table
+            with self.assertRaises(gsc.CompileError, msg=decl):
+                gsc.compile_source_with_pool(decl, table)
+
+    def test_undeclared_without_table_hints_at_the_fix(self):
+        with self.assertRaises(gsc.CompileError) as cm:
+            gsc.compile_source_with_pool("foo(1);")
+        self.assertIn("--upload", str(cm.exception))
+
+    def test_uses_syscalls_only_when_one_is_called(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        self.assertTrue(gsc.compile_script("read_adc();", table).uses_syscalls)
+        self.assertFalse(gsc.compile_script('cmd("GVER");', table).uses_syscalls)
 
 
 class _FakeSerialPort:
@@ -357,6 +464,9 @@ class _FakeSerialPort:
 
     def read(self, n):
         return self._responses.pop(0) if self._responses else b""
+
+    def read_until(self, terminator):
+        return self.read(0)
 
     def __enter__(self):
         return self
@@ -434,6 +544,152 @@ class UploadChunkingTests(unittest.TestCase):
         status, sent = self._run_upload("aabbccdd", chunk_bytes=200, responses=[b""])
         self.assertEqual(status, 1)
         self.assertEqual(sent, ["SCRIPTLOAD,0,aabbccdd"])
+
+
+def _gsyscalls_reply(table, corrupt_hash=False):
+    """The lines a device sends for GSYSCALLS, one canned read per line."""
+    h = table.hash ^ (1 if corrupt_hash else 0)
+    lines = [b"\x06" + f"{len(table.entries)},{h:08X}\r\n".encode()]
+    for i, (name, argc, returns) in enumerate(table.entries):
+        lines.append(f"{i},{name},{argc},{returns}\r\n".encode())
+    return lines
+
+
+class QuerySyscallTableTests(unittest.TestCase):
+    def _query(self, responses):
+        port = _FakeSerialPort(responses)
+        return gsc.query_syscall_table(port), port.sent
+
+    def test_parses_a_device_reply(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        (got, reason), sent = self._query(_gsyscalls_reply(table))
+        self.assertIsNone(reason)
+        self.assertEqual(got.entries, table.entries)
+        self.assertEqual(sent, ["GSYSCALLS"])
+
+    def test_tolerates_an_echoed_command_line_before_the_ack(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        (got, _), _ = self._query([b"GSYSCALLS\r\n"] + _gsyscalls_reply(table))
+        self.assertEqual(got.entries, table.entries)
+
+    def test_empty_table(self):
+        (got, _), _ = self._query([b"\x060,811C9DC5\r\n"])
+        self.assertEqual(got.entries, [])
+
+    def test_nak_means_unsupported_not_an_error(self):
+        (got, reason), _ = self._query([b"\x15?\r\n"])
+        self.assertIsNone(got)
+        self.assertIn("NAK", reason)
+
+    def test_no_response_means_unsupported_not_an_error(self):
+        (got, reason), _ = self._query([])
+        self.assertIsNone(got)
+        self.assertIn("no response", reason)
+
+    def test_hash_disagreement_is_an_error(self):
+        table = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+        with self.assertRaises(gsc.SyscallTableError):
+            self._query(_gsyscalls_reply(table, corrupt_hash=True))
+
+    def test_malformed_line_is_an_error(self):
+        with self.assertRaises(gsc.SyscallTableError):
+            self._query([b"\x061,00000001\r\n", b"0,only_two\r\n"])
+
+
+class UploadWithSyscallTableTests(unittest.TestCase):
+    """gsc.main(--upload ...) end to end against a fake serial port: the
+    GSYSCALLS query, compiling against the answer, and the hash stamp."""
+
+    TABLE = gsc.SyscallTable(SHARED_VECTOR_TABLE)
+
+    def _main(self, source, responses, extra=()):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.gs")
+            with open(path, "w") as f:
+                f.write(source)
+            fake = _FakeSerialModule(responses)
+            with mock.patch.dict(sys.modules, {"serial": fake}), \
+                 mock.patch("time.sleep"), \
+                 mock.patch("sys.stderr", new_callable=io.StringIO) as err, \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                status = gsc.main([path, "--upload", "FAKE", "--slot", "2", *extra])
+        return status, fake.last_port.sent, err.getvalue()
+
+    def test_script_using_a_syscall_is_compiled_against_the_device_and_stamped(self):
+        status, sent, _ = self._main("set_volts(read_adc());",
+                                      _gsyscalls_reply(self.TABLE) + [b"\x06"])
+        self.assertEqual(status, 0)
+        self.assertEqual(sent[0], "GSYSCALLS")
+        self.assertTrue(sent[1].startswith("SCRIPTLOAD,2,"))
+        self.assertTrue(sent[1].endswith(f",{SHARED_VECTOR_HASH:08X}"))
+
+    def test_cmd_only_script_is_not_stamped(self):
+        status, sent, _ = self._main('cmd("GVER");', _gsyscalls_reply(self.TABLE) + [b"\x06"])
+        self.assertEqual(status, 0)
+        self.assertNotIn(f",{SHARED_VECTOR_HASH:08X}", sent[1])
+
+    def test_hash_goes_on_scriptcommit_for_a_chunked_upload(self):
+        body = "".join("read_adc();" for _ in range(80))   # well over one chunk
+        status, sent, _ = self._main(body, _gsyscalls_reply(self.TABLE) + [b"\x06"] * 8,
+                                      extra=("--chunk-bytes", "50"))
+        self.assertEqual(status, 0)
+        appends = [s for s in sent if s.startswith("SCRIPTAPPEND")]
+        self.assertGreater(len(appends), 1)
+        self.assertTrue(all(f"{SHARED_VECTOR_HASH:08X}" not in s for s in appends))
+        self.assertTrue(sent[-1].startswith("SCRIPTCOMMIT,2,"))
+        self.assertTrue(sent[-1].endswith(f",{SHARED_VECTOR_HASH:08X}"))
+
+    def test_device_without_a_table_falls_back_to_declarations(self):
+        status, sent, err = self._main("syscall foo(a) = 0; foo(1);", [b"\x15?\r\n", b"\x06"])
+        self.assertEqual(status, 0)
+        self.assertIn("note: no syscall table", err)
+        self.assertNotIn(",", sent[1].split(",2,", 1)[1])   # no hash argument
+
+    def test_device_without_a_table_and_no_declaration_is_a_compile_error(self):
+        status, sent, err = self._main("foo(1);", [b"\x15?\r\n"])
+        self.assertEqual(status, 1)
+        self.assertIn("undeclared syscall", err)
+        self.assertEqual(sent, ["GSYSCALLS"])   # never reached the upload
+
+    def test_unknown_syscall_is_caught_before_anything_is_sent(self):
+        status, sent, err = self._main("set_volt(1);", _gsyscalls_reply(self.TABLE))
+        self.assertEqual(status, 1)
+        self.assertIn("not a syscall on this device", err)
+        self.assertEqual(sent, ["GSYSCALLS"])
+
+    def test_no_device_syscalls_skips_the_query(self):
+        status, sent, _ = self._main("syscall foo(a) = 0; foo(1);", [b"\x06"],
+                                      extra=("--no-device-syscalls",))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith("SCRIPTLOAD"))
+
+    def test_syscalls_file_replaces_the_query_and_still_stamps(self):
+        with tempfile.TemporaryDirectory() as d:
+            table_path = os.path.join(d, "dev.json")
+            with open(table_path, "w") as f:
+                f.write(self.TABLE.to_json())
+            status, sent, _ = self._main("read_adc();", [b"\x06"], extra=("--syscalls", table_path))
+        self.assertEqual(status, 0)
+        self.assertEqual(len(sent), 1)   # no GSYSCALLS
+        self.assertTrue(sent[0].endswith(f",{SHARED_VECTOR_HASH:08X}"))
+
+    def test_save_syscalls_writes_what_the_device_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "saved.json")
+            self._main("read_adc();", _gsyscalls_reply(self.TABLE) + [b"\x06"],
+                       extra=("--save-syscalls", out))
+            with open(out) as f:
+                self.assertEqual(gsc.SyscallTable.from_json(f.read()).entries, self.TABLE.entries)
+
+    def test_list_syscalls(self):
+        fake = _FakeSerialModule(_gsyscalls_reply(self.TABLE))
+        with mock.patch.dict(sys.modules, {"serial": fake}), mock.patch("time.sleep"), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            status = gsc.main(["--list-syscalls", "FAKE"])
+        self.assertEqual(status, 0)
+        self.assertIn("float get_volts(a0)", out.getvalue())
+        self.assertIn(f"{SHARED_VECTOR_HASH:08X}", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -10,15 +10,12 @@ a serial terminal.
 
 ## 1. Write the script
 
-A plain `.gs` file. Either declare your own syscalls, or call straight into
-whatever the project's command processor already exposes with `cmd()` — no
+A plain `.gs` file. Call the project's syscalls by name (the device tells
+the compiler what they are — nothing to declare), or call straight into
+whatever its command processor already exposes with `cmd()`/`cmdf()` — no
 firmware change needed either way. Example (`drive_limit.gs`):
 
 ```
-syscall read_power() : float = 0;
-syscall max_drive() : float = 1;
-syscall set_max_drive(v) = 2;
-
 watts = read_power();
 if (watts > 100.0) {
   drive = max_drive() - 5.0;
@@ -32,7 +29,13 @@ if (watts > 100.0) {
 python3 tools/gsc.py drive_limit.gs --upload /dev/ttyUSB0 --slot 1
 ```
 
-Compiles, opens that serial port itself, and sends the result (the code and
+Opens that serial port, asks the device for its syscall table
+(`GSYSCALLS`) and compiles against it — so `read_power()` above resolves to
+the firmware's real syscall, with its real id, argument count and `float`
+return type, and a typo or a syscall the device doesn't have is a compile
+error here instead of a wrong call on the device. (Firmware without a table
+works as before: declare each syscall at the top of the script with
+`syscall NAME(...) = ID;`.) It then sends the result (the code and
 string-constant pool combined with the `[codeLen][code][pool]` length
 prefix the device expects). For a small script that's a single
 `SCRIPTLOAD,1,<hex>`; past `--chunk-bytes` (default 200 decoded bytes —
@@ -50,9 +53,16 @@ OK: script loaded into slot 1 (640 bytes, 4 SCRIPTAPPEND chunks + SCRIPTCOMMIT)
 or, on failure:
 
 ```
-NAK: device rejected SCRIPTLOAD (bad slot/offset, malformed hex, or over
-the configured size limit -- see GSCRIPTLIMITS)
+NAK: device rejected SCRIPTLOAD (bad slot/offset, malformed hex, over the
+configured size limit -- see GSCRIPTLIMITS -- or, if a syscall table hash was
+sent, the firmware's syscalls differ ...)
 ```
+
+A script that calls syscalls is sent with the table's hash, and the device
+NAKs the load if its own table differs — so a script is never run against
+syscalls other than the ones it was compiled for. `--list-syscalls PORT`
+shows what a device offers; add `--save-syscalls dev.json` to keep a copy and
+compile later with `--syscalls dev.json` and no device attached.
 
 Requires `pyserial` (`pip install pyserial`). `--baud` (default 115200) and
 `--timeout` (default 3.0s) tune the connection if needed. Add `--disasm` to

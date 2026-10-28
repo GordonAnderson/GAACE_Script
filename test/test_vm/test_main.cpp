@@ -408,6 +408,48 @@ static void test_cmdcallf_asks_bridge_for_float(void) {
   TEST_ASSERT_TRUE(lastBridgeWantFloat);
 }
 
+// ---------------------------------------------------------------------------
+// Syscall descriptor table hash
+// ---------------------------------------------------------------------------
+
+static int32_t noopSyscall(int32_t *args, uint8_t argc) { return 0; }
+
+static void test_syscall_table_hash_matches_shared_vector(void) {
+  // Same table and expected value as tools/test_gsc.py's
+  // test_hash_matches_shared_vector -- this is what pins the C++ and Python
+  // implementations of the hash to each other.
+  static const SyscallDesc table[] = {
+    {"read_adc",  noopSyscall, 0, false},
+    {"set_volts", noopSyscall, 1, false},
+    {"get_volts", noopSyscall, 1, true},
+  };
+  TEST_ASSERT_EQUAL_HEX32(0x892E7C6Fu, syscallTableHash(table, 3));
+}
+
+static void test_syscall_table_hash_empty_table(void) {
+  TEST_ASSERT_EQUAL_HEX32(0x811C9DC5u, syscallTableHash(nullptr, 0));
+}
+
+static void test_syscall_table_hash_changes_with_any_difference(void) {
+  static const SyscallDesc base[]     = {{"a", noopSyscall, 1, false}, {"b", noopSyscall, 0, false}};
+  static const SyscallDesc renamed[]  = {{"a", noopSyscall, 1, false}, {"c", noopSyscall, 0, false}};
+  static const SyscallDesc argcDiff[] = {{"a", noopSyscall, 2, false}, {"b", noopSyscall, 0, false}};
+  static const SyscallDesc retDiff[]  = {{"a", noopSyscall, 1, true},  {"b", noopSyscall, 0, false}};
+  static const SyscallDesc reordered[] = {{"b", noopSyscall, 0, false}, {"a", noopSyscall, 1, false}};
+  uint32_t h = syscallTableHash(base, 2);
+  TEST_ASSERT_NOT_EQUAL(h, syscallTableHash(renamed, 2));
+  TEST_ASSERT_NOT_EQUAL(h, syscallTableHash(argcDiff, 2));
+  TEST_ASSERT_NOT_EQUAL(h, syscallTableHash(retDiff, 2));
+  TEST_ASSERT_NOT_EQUAL(h, syscallTableHash(reordered, 2));
+  TEST_ASSERT_NOT_EQUAL(h, syscallTableHash(base, 1));   // dropped an entry
+}
+
+static void test_syscall_table_hash_multi_digit_argc(void) {
+  // argc >= 10 must hash as the decimal text "10", like Python's str(10).
+  static const SyscallDesc t[] = {{"wide", noopSyscall, 10, false}};
+  TEST_ASSERT_EQUAL_HEX32(0x87223431u, syscallTableHash(t, 1));
+}
+
 static void test_cmdcall_without_bridge_registered_errors(void) {
   static const uint8_t pool[] = "FOO\0";
   Asm a;
@@ -470,6 +512,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_power_to_drive_example);
   RUN_TEST(test_cmdcall_invokes_bridge_with_name_and_args);
   RUN_TEST(test_cmdcallf_asks_bridge_for_float);
+  RUN_TEST(test_syscall_table_hash_matches_shared_vector);
+  RUN_TEST(test_syscall_table_hash_empty_table);
+  RUN_TEST(test_syscall_table_hash_changes_with_any_difference);
+  RUN_TEST(test_syscall_table_hash_multi_digit_argc);
   RUN_TEST(test_cmdcall_without_bridge_registered_errors);
   RUN_TEST(test_cmdcall_offset_out_of_range_errors);
   RUN_TEST(test_cmdcall_missing_terminator_errors);

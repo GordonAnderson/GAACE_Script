@@ -102,8 +102,12 @@ commandProcessor   cp;
 ScriptRuntime       scripts(&cp, &control);   // GAACE_SCRIPT_SLOTS slots (default 4)
 
 cp.registerCommands(scripts.scriptCmdList());
-scripts.registerSyscall(sys_read_adc);         // id 0, registered on every slot
-scripts.registerSyscall(sys_send_device);      // id 1
+
+static const SyscallDesc syscalls[] = {        // see "Syscall tables" below
+  {"read_adc",    sys_read_adc,    0, false},  // id 0 (the index), on every slot
+  {"send_device", sys_send_device, 1, false},  // id 1
+};
+scripts.registerSyscalls(syscalls, 2);
 ```
 
 Each slot is its own named `Thread` ("Script0".."Script&lt;N-1&gt;") added to
@@ -114,9 +118,63 @@ only genuinely new commands are:
 
 | Command | Purpose |
 | --- | --- |
-| `SCRIPTLOAD,<slot>,<hex>` | Decode `<hex>` (`gsc.py --scriptload --format hex`, i.e. `[codeLen][code][pool]`) and load it into `<slot>`. NAKs on a bad slot, malformed hex, or a payload over the configured size limit — never silently accepts something it can't run. |
+| `GSYSCALLS` | The registered syscall table: `count,hash`, then `index,name,argc,int\|float` per syscall — see "Syscall tables" below. NAKs if the project never called `registerSyscalls()`. |
+| `SCRIPTLOAD,<slot>,<hex>[,<hash>]` | Decode `<hex>` (`gsc.py --scriptload --format hex`, i.e. `[codeLen][code][pool]`) and load it into `<slot>`. NAKs on a bad slot, malformed hex, or a payload over the configured size limit — never silently accepts something it can't run. |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` — lets a host discover the compile-time limits below at runtime instead of hardcoding them. |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` — the one piece of VM-specific state `threadCommands` doesn't know about. |
+
+`SCRIPTLOAD` and `SCRIPTCOMMIT` take an optional trailing `<hash>` (the
+syscall table hash, below); `gsc.py --upload` supplies it for you.
+
+### Syscall tables
+
+A syscall is a C++ function the project registers. Rather than numbering
+`registerSyscall()` calls by hand and mirroring that order in every script,
+describe them once:
+
+```c++
+static const SyscallDesc syscalls[] = {
+  {"read_adc",   sys_read_adc,   0, false},   // name, function, argc, returns float?
+  {"get_volts",  sys_get_volts,  1, true },
+};
+scripts.registerSyscalls(syscalls, 2);
+```
+
+A syscall's **id is its index** in the array, so there is no second list to
+keep in sync. That one table then does three jobs:
+
+1. **Scripts need no declarations.** `gsc.py --upload` asks the device for
+   its table (`GSYSCALLS`) and compiles against it, so a script just calls
+   `v = get_volts(1);` — id, argument count and `float` return type all come
+   from the firmware itself. A call the device doesn't have, or with the
+   wrong number of arguments, is a compile error. (An explicit
+   `syscall NAME(...) = ID;` is still accepted, and must agree with the
+   table.)
+2. **A script can't run against the wrong syscalls.** The table has a hash
+   (FNV-1a over each entry's name, argument count and return type, in
+   order). `gsc.py` sends the hash with the script; the device refuses the
+   load if it differs from its own. Adding, removing, renaming or reordering
+   a syscall changes it. A script that only uses `cmd()`/`cmdf()` doesn't
+   call syscalls, so isn't stamped and keeps working across such changes.
+3. **Persisted scripts are protected too.** Each loaded slot remembers its
+   hash in `ScriptSlot::syscallHash` (0 = loaded unchecked). A project that
+   saves slots across reboots should store it with the buffer and refuse to
+   restore a script whose hash no longer matches `scripts.syscallHash()` —
+   see USBrepeater for the pattern. Without that, a firmware update that
+   reorders syscalls would make a saved script quietly call different
+   functions.
+
+Rules: call `registerSyscalls()` once, before any `registerSyscall()`
+(returns `false` otherwise, registering nothing); the array must stay alive
+(`static const`); **append new syscalls at the end** — inserting or
+reordering renumbers the ones after, and changes the hash, so existing
+scripts are refused until recompiled. The older `registerSyscall(fn)` still
+works for a project that wants unnamed syscalls, but then there's no table
+to report, no hash, and scripts must declare their syscalls by hand.
+
+For offline work, `gsc.py --list-syscalls PORT --save-syscalls dev.json`
+saves the table, and `--syscalls dev.json` compiles against it later with
+no device attached. See [tools/README.md](tools/README.md).
 
 Every limit is a per-project `#define` with a sensible default, so a
 resource-tight board and a resource-rich one can both use this without
@@ -205,4 +263,8 @@ still open there (script persistence across reboot, a boot-notification
 primitive, real-hardware validation of that specific integration). See
 this repo's own [TODO.md](TODO.md) for what's open here specifically
 (license, `stm32` parity, known `cmd()` limitations, deferred host-app
-integration).
+integration). The syscall table (`registerSyscalls()`, `GSYSCALLS`, the load
+hash) is covered by native tests and a Python suite (including the C++/Python
+hash pinned to one shared test vector) and builds for Teensy 4.1 and the
+SAMD21; its on-device command tests in `test/test_runtime` have been
+compiled but not yet run on hardware.

@@ -24,6 +24,42 @@ the working list of what's still unresolved.
       in a real product; the `--upload` CLI flag is the right-sized
       interim answer.
 
+## Syscall tables (`registerSyscalls()` / `GSYSCALLS` / load-time hash)
+
+Built: one `SyscallDesc` table per project (id = index) replaces
+hand-numbered `registerSyscall()` calls and per-script declarations; the
+device reports it (`GSYSCALLS`), `gsc.py --upload` compiles against it, and
+`SCRIPTLOAD`/`SCRIPTCOMMIT` take the table's hash so a script can't run
+against different syscalls. Open items:
+
+- [ ] **`test/test_runtime`'s new syscall-table tests have not been run on
+      hardware.** They compile for the QT Py M0 (and USBrepeater builds for
+      Teensy 4.1 against this library), and the logic is also covered by the
+      native tests and `tools/test_gsc.py`, but the command handlers
+      (`GSYSCALLS`, the optional `<hash>` argument) have only been exercised
+      against a fake serial port on the host. Run
+      `pio test -e adafruit_qt_py_m0 --upload-port <port>`.
+- [ ] **Syscall *arguments* are still untyped.** The table records the
+      argument count and the return type, not each argument's type, so
+      `set_volts(3)` vs `set_volts(3.0)` is still the caller's responsibility
+      (same limitation as `cmd()`'s integer-formatted arguments, below).
+      Per-argument types in `SyscallDesc` would let the compiler convert
+      automatically — and is the natural way to fix `cmd()` too.
+- [ ] **Compiled-in (build-time) scripts are unchecked.** A script embedded
+      via `vmInit()` in `setup()` (USBrepeater's ADC demo) has no hash, since
+      there's no device to query when it's compiled. It keeps explicit
+      declarations that must match the table's order by hand. A build step
+      that emits the table's hash alongside `ScriptBytecode.h` would close
+      this.
+- [ ] **One table per runtime, registered once.** `registerSyscalls()`
+      refuses a second call or a call after a legacy `registerSyscall()`
+      (ids must start at 0). A project wanting to add syscalls from several
+      modules has to gather them into one array first.
+- [x] ~~`SCRIPTLOAD` left a slot marked loaded after a failed decode.~~ The
+      decode overwrites the slot's buffer before later checks (layout,
+      syscall hash) can still reject the load; the slot is now marked
+      not-loaded for the duration, as `SCRIPTAPPEND` already did.
+
 ## Known, accepted limitations (not bugs — documented behavior)
 
 - [ ] `cmd()`'s return value can't distinguish NAK from "ACK with value

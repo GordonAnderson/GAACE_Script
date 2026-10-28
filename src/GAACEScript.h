@@ -142,6 +142,39 @@ typedef int32_t (*SyscallFn)(int32_t *args, uint8_t argc);
 typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc,
                                bool wantFloat);
 
+// ---------------------------------------------------------------------------
+// Syscall descriptor table
+//
+// A project describes its syscalls once, in one array, instead of hand-
+// numbering registerSyscall() calls and mirroring the order in every script:
+//
+//   static const SyscallDesc syscalls[] = {
+//     {"read_adc",   sys_read_adc,   0, false},   // id 0
+//     {"set_volts",  sys_set_volts,  1, false},   // id 1
+//     {"get_volts",  sys_get_volts,  1, true },   // id 2 (returns float)
+//   };
+//   scripts.registerSyscalls(syscalls, 3);
+//
+// A syscall's id is its index in the array. The table is what the device
+// reports to the host (GSYSCALLS) so gsc.py can compile a script against the
+// firmware's real syscalls, and its hash (below) is what lets the device
+// refuse a script compiled against a different table.
+// ---------------------------------------------------------------------------
+struct SyscallDesc {
+  const char *name;      // identifier a script calls it by
+  SyscallFn   fn;
+  uint8_t     argc;      // number of arguments the syscall takes
+  bool        returnsFloat;  // true: fn's return is a float32 bit pattern
+};
+
+// FNV-1a (32-bit) over "name:argc:i|f;" for each entry in order, so the hash
+// changes if a syscall is added, removed, renamed, reordered, or has its
+// argument count or return type changed -- anything that would make a
+// previously compiled script call the wrong thing. Never returns 0 (0 means
+// "not checked" wherever a hash is optional). tools/gsc.py computes the same
+// value; both are pinned to a shared test vector.
+uint32_t syscallTableHash(const SyscallDesc *table, uint8_t count);
+
 struct VM {
   int32_t stack[STACK_SIZE];
   int32_t vars[VAR_SLOTS];

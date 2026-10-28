@@ -39,6 +39,24 @@ static inline Status pop(VM &vm, int32_t &v) {
   return VM_OK;
 }
 
+uint32_t syscallTableHash(const SyscallDesc *table, uint8_t count) {
+  uint32_t h = 0x811C9DC5u;
+  auto mix = [&h](uint8_t b) { h = (h ^ b) * 0x01000193u; };
+  for (uint8_t i = 0; i < count; i++) {
+    for (const char *p = table[i].name; *p != '\0'; p++) mix((uint8_t)*p);
+    mix(':');
+    // argc as decimal digits, no leading zeros (matches Python's str(int))
+    char digits[3];
+    uint8_t n = 0, v = table[i].argc;
+    do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v != 0);
+    while (n > 0) mix((uint8_t)digits[--n]);
+    mix(':');
+    mix(table[i].returnsFloat ? 'f' : 'i');
+    mix(';');
+  }
+  return h == 0 ? 1u : h;
+}
+
 void vmInit(VM &vm, const uint8_t *code, uint16_t codeLen) {
   vm.code = code;
   vm.codeLen = codeLen;

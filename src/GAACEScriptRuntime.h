@@ -9,8 +9,19 @@
 //   GAACEScript::ScriptRuntime scripts(&cp, &control);
 //
 //   cp.registerCommands(scripts.scriptCmdList());
-//   scripts.registerSyscall(sys_read_adc);    // id 0, on every slot
-//   scripts.registerSyscall(sys_send_device); // id 1, on every slot
+//
+//   // Describe the project's syscalls once. A syscall's id is its index; the
+//   // table is also what the device reports to gsc.py (GSYSCALLS) so scripts
+//   // need no hand-written `syscall NAME(...) = ID;` lines. See GAACEScript.h.
+//   static const SyscallDesc syscalls[] = {
+//     {"read_adc",    sys_read_adc,    0, false},   // id 0
+//     {"send_device", sys_send_device, 1, false},   // id 1
+//   };
+//   scripts.registerSyscalls(syscalls, 2);          // on every slot
+//
+// (The older scripts.registerSyscall(fn) still works for a project that
+// wants numbered, unnamed syscalls, but then has no table to report and no
+// hash to check -- scripts must declare their syscalls by hand.)
 //
 // Each slot is its own named Thread ("Script0".."Script<N-1>") added to the
 // supplied ThreadController -- so starting/stopping a script and changing
@@ -20,7 +31,15 @@
 // and querying limits/status, which threadCommands has no notion of.
 //
 // New commands (see GAACEScriptRuntime.cpp for exact behavior):
-//   SCRIPTLOAD,<slot>,<hex>   Decode <hex> ([codeLen:u16][code][pool] -- see
+//   GSYSCALLS                 The syscall table registerSyscalls() was given:
+//                             first line "count,hash" (hash is 8 hex digits,
+//                             see GAACEScript.h's syscallTableHash()), then
+//                             one "index,name,argc,int|float" line per
+//                             syscall. NAKs if no table was registered.
+//                             gsc.py --upload reads this to compile scripts
+//                             against the firmware's real syscalls.
+//   SCRIPTLOAD,<slot>,<hex>[,<hash>]
+//                             Decode <hex> ([codeLen:u16][code][pool] -- see
 //                             gsc.py --scriptload) and load it into <slot>
 //                             in one call. NAKs (ERR_BADARG) on a bad slot
 //                             index, malformed hex, or a decoded payload
@@ -37,12 +56,21 @@
 //                             gsc.py --upload does this automatically once a
 //                             script is too big for a single SCRIPTLOAD.
 //                             Marks the slot not-loaded until SCRIPTCOMMIT.
-//   SCRIPTCOMMIT,<slot>,<totalLen>
+//   SCRIPTCOMMIT,<slot>,<totalLen>[,<hash>]
 //                             Finalize a buffer assembled via one or more
 //                             SCRIPTAPPEND calls: validate the
 //                             [codeLen:u16][code][pool] layout against
 //                             <totalLen>, then load it into <slot> exactly
 //                             like SCRIPTLOAD does.
+//
+//   Optional <hash> on SCRIPTLOAD/SCRIPTCOMMIT: the 8-hex-digit hash of the
+//   syscall table the script was compiled against (gsc.py stamps it
+//   automatically). The device NAKs the load if it differs from its own
+//   table's hash, so a script can never silently run against a different
+//   set of syscalls. Omitted = unchecked (the script's explicit syscall
+//   ids are trusted, as before). A loaded slot remembers its hash in
+//   ScriptSlot::syscallHash (0 = unchecked) so a project that persists
+//   slots can re-check it on restore.
 //   GSCRIPTLIMITS             slots,maxCodeLen,stackSize,varSlots,maxSyscalls
 //                             (maxCodeLen is the payload budget per slot,
 //                             i.e. the 2-byte length prefix + code + pool
@@ -128,6 +156,12 @@ public:
   uint8_t  code[SCRIPT_MAX_CODE_LEN];
   uint16_t codeLen = 0;
   bool     loaded  = false;
+  // Hash of the syscall table the loaded script was compiled against, as
+  // given to SCRIPTLOAD/SCRIPTCOMMIT; 0 = the script was loaded unchecked.
+  // A project that persists slots across reboots should save this with the
+  // buffer and refuse to restore a script whose hash no longer matches
+  // ScriptRuntime::syscallHash() (e.g. after a firmware update).
+  uint32_t syscallHash = 0;
   Status   lastStatus = VM_OK;
   uint16_t maxSteps   = 500;   // vmRun() step budget per tick
 
@@ -149,9 +183,26 @@ public:
   // identical), or 0xFF if any slot's table is full.
   uint8_t registerSyscall(SyscallFn fn);
 
+  // Registers a whole described table on every slot's VM; each syscall's id
+  // is its index. Call once, before any registerSyscall(). The array must
+  // outlive this object (use a static const array). Returns false -- and
+  // registers nothing -- if a table is already registered, any syscall was
+  // already registered, `count` is over GAACE_SCRIPT_MAX_SYSCALLS, or an
+  // entry has a null name or fn.
+  bool registerSyscalls(const SyscallDesc *table, uint8_t count);
+
+  // Hash of the registered table (see syscallTableHash()), or 0 if no table
+  // was registered via registerSyscalls().
+  uint32_t syscallHash() const { return syscallHash_; }
+
   CommandList *scriptCmdList(void);
 
   commandProcessor *cp_;  // used by the file-scope command handlers (see .cpp)
+
+  // State for GSYSCALLS / the optional <hash> check; set by registerSyscalls().
+  const SyscallDesc *syscallTable_ = nullptr;
+  uint8_t            syscallCount_ = 0;
+  uint32_t           syscallHash_  = 0;
 };
 
 } // namespace GAACEScript

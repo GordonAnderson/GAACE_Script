@@ -42,6 +42,12 @@ if (sum > 10) {
   `vmRun()` calls (a periodic script whose caller only resets `pc`/`sp`
   between ticks, not `vars`), so the script can read it before ever
   writing it in the current run.
+- **Syscalls need no declaration when you compile against a device's
+  table.** With `--upload` (which asks the device) or `--syscalls FILE`
+  (a saved table), write `volts = get_volts(1);` and nothing else — see
+  "Syscall tables" below. The `syscall` declarations in this section are
+  for firmware that doesn't describe its syscalls, or to compile with no
+  table at all.
 - `syscall NAME(...) : float = ID;` declares a syscall whose C++
   implementation returns a float (bit-cast into the same `int32_t` return
   value — see `../src/GAACEScript.h`); omit `: float` for an `int`-returning
@@ -138,6 +144,50 @@ What this means in practice:
 - `--disasm` reads the pool to show `CMDCALL "SADCPIN"` rather than a bare
   offset.
 
+### Syscall tables: scripts without declarations
+
+If the firmware registers its syscalls with `ScriptRuntime::registerSyscalls()`
+(see the top-level README), the device can describe them, and the compiler
+uses that description instead of your declarations:
+
+```
+volts = get_volts(1);           // no `syscall get_volts(...) = 2;` line needed
+if (volts > 3.0) { set_volts(2.5); }
+```
+
+- **Source of the table.** `--upload PORT` queries the device itself
+  (`GSYSCALLS`) before compiling. `--syscalls FILE` uses a saved table
+  instead (no device needed to compile). `--no-device-syscalls` skips the
+  query and goes back to explicit declarations only.
+- **What it checks.** A call to a name the device doesn't have is a compile
+  error that lists what it does have. Argument count and `float` return
+  type come from the table, so they can't be mis-declared. If you do write
+  a `syscall` declaration for a name in the table, it must match (id,
+  arguments, return type) or compilation stops — delete it and let the
+  table decide.
+- **The load is checked too.** When a script calls at least one syscall,
+  `--upload` sends the table's hash as the optional last argument of
+  `SCRIPTLOAD`/`SCRIPTCOMMIT`, and the device NAKs if its own table hashes
+  differently (the firmware was updated since you saved your table, or
+  you're pointed at the wrong device). A script that only uses `cmd()` /
+  `cmdf()` isn't stamped.
+- **Older firmware.** A device with no table (NAK, or nothing to answer
+  `GSYSCALLS`) isn't an error: you get a note, the script must declare its
+  own syscalls as before, and the load is unchecked.
+
+```
+python3 gsc.py --list-syscalls /dev/ttyUSB0                   # print the device's syscalls
+python3 gsc.py --list-syscalls /dev/ttyUSB0 --save-syscalls dev.json
+python3 gsc.py prog.gs --syscalls dev.json --scriptload --format hex
+                                                              # offline; prints the hash to
+                                                              # append to SCRIPTLOAD
+```
+
+The saved file is plain JSON (`hash` plus a `syscalls` list of `name`,
+`argc`, `returns`); ids are list positions. Re-save it whenever the firmware
+changes — an out-of-date file is caught at load time by the hash, not
+silently trusted.
+
 ## Usage
 
 ```
@@ -153,6 +203,10 @@ python3 gsc.py program.gs --format carray --carray-name script
 python3 gsc.py program.gs --scriptload --format hex    # [codeLen][code][pool] combined --
                                                         # paste straight into
                                                         # SCRIPTLOAD,<slot>,<hex>
+python3 gsc.py program.gs --upload /dev/ttyUSB0 --slot 1 --save-syscalls dev.json
+                                                        # --upload first asks the device for its
+                                                        # syscall table (see above); this also
+                                                        # keeps a copy for offline use
 python3 gsc.py program.gs --disasm                     # print disassembly (shows cmd()
                                                         # names resolved from the pool)
 python3 gsc.py program.gs --upload /dev/ttyUSB0 --slot 1
