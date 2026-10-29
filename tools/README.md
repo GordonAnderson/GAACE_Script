@@ -108,6 +108,15 @@ blobs: the **code**, and a **pool** of NUL-terminated name strings. Each
 command call in the code is `CMDCALL <poolOffset:u16> <argc>` (`CMDCALLF`
 for `cmdf()`), where `poolOffset` is the byte offset of its name in the pool.
 
+**Float arguments.** `cmd("SETV", 23.76);` sends the text `SETV,23.76` —
+the compiler knows each argument's type, so a float expression is formatted
+as a decimal number (up to 7 significant digits), an int as an integer. A
+call with at least one float argument compiles to `CMDCALLM`/`CMDCALLMF`,
+which add a 2-byte mask (bit *i* set = argument *i* is a float); all-int
+calls keep the original 4-byte form, so existing bytecode is unchanged.
+Limit: at most 16 arguments, and the whole command line must fit the
+bridge's 64-byte buffer.
+
 For `cmd("SADCPIN", 5); cmd("GVER");`:
 
 ```

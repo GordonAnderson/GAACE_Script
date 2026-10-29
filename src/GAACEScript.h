@@ -24,6 +24,12 @@ namespace GAACEScript {
 //   OP_CALL <id> <argc>                   3 bytes total
 //   OP_CMDCALL  <poolOffset:u16> <argc>   4 bytes total
 //   OP_CMDCALLF <poolOffset:u16> <argc>   4 bytes total (float-returning)
+//   OP_CMDCALLM  <poolOffset:u16> <argc> <floatMask:u16>   6 bytes total
+//   OP_CMDCALLMF <poolOffset:u16> <argc> <floatMask:u16>   6 bytes total
+//       (same as CMDCALL/CMDCALLF, but bit i of floatMask set => argument i
+//       is a float32 and the bridge formats it as a decimal number, not as
+//       its raw bit pattern. The compiler emits these only when a call has
+//       at least one float argument; all-int calls keep the 4-byte form.)
 //   everything else                      1 byte (no operand)
 //
 // Floats: a stack/variable slot is just 4 bytes with no type tag anywhere --
@@ -88,6 +94,8 @@ enum Opcode : uint8_t {
   OP_F2I,   // pop float32, push its int32 truncation (toward zero)
   OP_CMDCALL,
   OP_CMDCALLF,  // same as CMDCALL, but asks the bridge for a float32 result
+  OP_CMDCALLM,  // CMDCALL with a float-argument mask (see header comment)
+  OP_CMDCALLMF, // CMDCALLF with a float-argument mask
 };
 
 enum Status : uint8_t {
@@ -139,8 +147,12 @@ typedef int32_t (*SyscallFn)(int32_t *args, uint8_t argc);
 // must then return the response parsed as a float32, bit-cast into the
 // int32_t return (the same convention syscalls use for `: float`). For plain
 // CMDCALL it is false and the bridge returns an ordinary int32.
+//
+// `floatMask`: bit i set means args[i] holds a float32's bit pattern (the
+// script passed a float expression) and must be formatted as a number, not
+// an integer. 0 for plain CMDCALL/CMDCALLF.
 typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc,
-                               bool wantFloat);
+                               bool wantFloat, uint16_t floatMask);
 
 // ---------------------------------------------------------------------------
 // Syscall descriptor table

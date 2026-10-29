@@ -290,10 +290,15 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
       }
 
       case OP_CMDCALL:
-      case OP_CMDCALLF: {
-        if ((uint32_t)vm.pc + 4 > vm.codeLen) return VM_ERR_BAD_JUMP;
+      case OP_CMDCALLF:
+      case OP_CMDCALLM:
+      case OP_CMDCALLMF: {
+        const bool masked = (op == OP_CMDCALLM || op == OP_CMDCALLMF);
+        const uint8_t instrLen = masked ? 6 : 4;
+        if ((uint32_t)vm.pc + instrLen > vm.codeLen) return VM_ERR_BAD_JUMP;
         uint16_t poolOffset = readU16(&vm.code[vm.pc + 1]);
         uint8_t  argc       = vm.code[vm.pc + 3];
+        uint16_t floatMask  = masked ? readU16(&vm.code[vm.pc + 4]) : 0;
 
         if (vm.cmdBridge == nullptr) return VM_ERR_NO_CMD_BRIDGE;
         if (poolOffset >= vm.poolLen) return VM_ERR_BAD_POOL;
@@ -311,10 +316,11 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
           if (s != VM_OK) return s;
         }
         int32_t r = vm.cmdBridge((const char *)&vm.pool[poolOffset], args, argc,
-                                (op == OP_CMDCALLF));
+                                (op == OP_CMDCALLF || op == OP_CMDCALLMF),
+                                floatMask);
         Status s = push(vm, r);
         if (s != VM_OK) return s;
-        vm.pc += 4;
+        vm.pc += instrLen;
         break;
       }
 

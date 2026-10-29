@@ -25,7 +25,7 @@ static ScriptRuntime *activeInstance = nullptr;
 // cmd() bridge -- lets any script in any slot call into the project's own
 // commandProcessor by name (see GAACEScript.h's CMDCALL/CmdBridgeFn docs
 // and tools/README.md's cmd() language section). Builds "NAME,arg0,arg1"
-// and runs it through executeLine() (GAACE_Core), which never touches the
+// (ints as %d, arguments flagged in floatMask as %.7g) and runs it through executeLine() (GAACE_Core), which never touches the
 // shared ring buffer/output stream a real command might be mid-arriving
 // on -- see that method's own doc comment for why that isolation matters.
 //
@@ -34,13 +34,20 @@ static ScriptRuntime *activeInstance = nullptr;
 // no trailing number (e.g. a plain action command). NAK and
 // "ACK with value 0" are not distinguishable from the return value alone.
 // -----------------------------------------------------------------------
-static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat) {
+static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat,
+                         uint16_t floatMask) {
   commandProcessor &cp = *activeInstance->cp_;
 
   char line[64];
   int len = snprintf(line, sizeof(line), "%s", name);
   for (uint8_t i = 0; i < argc && len < (int)sizeof(line) - 1; i++) {
-    len += snprintf(line + len, sizeof(line) - (size_t)len, ",%d", (int)args[i]);
+    if (i < 16 && (floatMask & (1u << i))) {
+      float f;
+      memcpy(&f, &args[i], sizeof(f));
+      len += snprintf(line + len, sizeof(line) - (size_t)len, ",%.7g", (double)f);
+    } else {
+      len += snprintf(line + len, sizeof(line) - (size_t)len, ",%d", (int)args[i]);
+    }
   }
 
   char response[48];

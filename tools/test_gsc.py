@@ -57,9 +57,13 @@ static int32_t sys_set_max_drive(int32_t *args, uint8_t argc) {
 // Fake cmd() bridge: prints "CMD:<name>,<arg0>,<arg1>,...\n" so tests can
 // verify the right name/args reached it, and returns a fixed value the
 // script can act on.
-static int32_t fake_cmd_bridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat) {
+static int32_t fake_cmd_bridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat,
+                               uint16_t floatMask) {
   printf("CMD:%s", name);
-  for (uint8_t i = 0; i < argc; i++) printf(",%d", args[i]);
+  for (uint8_t i = 0; i < argc; i++) {
+    if (floatMask & (1u << i)) printf(",%g", asFloat(args[i]));
+    else printf(",%d", args[i]);
+  }
   printf("\n");
   if (wantFloat) return asBits(2.5f);
   return 123;
@@ -190,6 +194,27 @@ class StructuralTests(unittest.TestCase):
     def test_cmd_result_assigned_to_float_var_promotes(self):
         code, pool = gsc.compile_source_with_pool('var x: float; x = cmd("GVER");')
         self.assertIn(gsc.OP_I2F, code)
+
+    def test_cmd_int_args_keep_four_byte_form(self):
+        code, pool = gsc.compile_source_with_pool('cmd("SETV", 5, 6);')
+        self.assertIn(gsc.OP_CMDCALL, code)
+        self.assertNotIn(gsc.OP_CMDCALLM, code)
+
+    def test_cmd_float_arg_emits_masked_form(self):
+        code, pool = gsc.compile_source_with_pool('cmd("SETV", 3, 23.76);')
+        self.assertIn(gsc.OP_CMDCALLM, code)
+        i = code.index(gsc.OP_CMDCALLM)
+        self.assertEqual(code[i + 3], 2)                       # argc
+        self.assertEqual(int.from_bytes(code[i + 4:i + 6], "little"), 0b10)
+        self.assertEqual(code[i + 6], gsc.OP_POP)  # statement result discarded
+
+    def test_cmdf_float_arg_emits_masked_float_form(self):
+        code, pool = gsc.compile_source_with_pool('x = cmdf("GVOLT", 1.5);')
+        self.assertIn(gsc.OP_CMDCALLMF, code)
+
+    def test_disassemble_shows_floatmask(self):
+        code, pool = gsc.compile_source_with_pool('cmd("SETV", 23.76);')
+        self.assertIn('CMDCALLM "SETV" argc=1 floatmask=0x0001', gsc.disassemble(code, pool))
 
     def test_disassemble_shows_cmd_name_from_pool(self):
         code, pool = gsc.compile_source_with_pool('cmd("SADCPIN", 5);')
@@ -322,6 +347,17 @@ class EndToEndVmTests(unittest.TestCase):
         """)
         self.assertEqual(status, 1)
         self.assertEqual(lines, ["CMD:SADCPIN,5,6", "123"])
+
+    def test_cmd_float_arg_is_passed_as_number(self):
+        status, lines = self.run_script("""
+            syscall print(v) = 0;
+            var v: float;
+            v = 23.76;
+            result = cmd("SETV", 3, v, 2);
+            print(result);
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["CMD:SETV,3,23.76,2", "123"])
 
     def test_cmdf_returns_float(self):
         status, lines = self.run_script("""

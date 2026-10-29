@@ -42,7 +42,7 @@ against different syscalls. Open items:
 - [ ] **Syscall *arguments* are still untyped.** The table records the
       argument count and the return type, not each argument's type, so
       `set_volts(3)` vs `set_volts(3.0)` is still the caller's responsibility
-      (same limitation as `cmd()`'s integer-formatted arguments, below).
+      (`cmd()` arguments are now typed by the compiler; syscalls still aren't).
       Per-argument types in `SyscallDesc` would let the compiler convert
       automatically — and is the natural way to fix `cmd()` too.
 - [ ] **Compiled-in (build-time) scripts are unchecked.** A script embedded
@@ -68,10 +68,10 @@ against different syscalls. Open items:
 - [x] ~~`cmd()` response parsing is integer-only~~ — `cmd()` still
       returns an int (`atoi`), but `cmdf()` now returns the reply parsed
       as a float32. The script picks which up front.
-- [ ] `cmd()`/`cmdf()` *arguments* are still formatted as integers
-      (`%d`): a float argument is sent as its raw bit pattern, not
-      `3.5`. Sending fractional values to a command needs the same
-      treatment (type-aware formatting in the bridge).
+- [x] ~~`cmd()`/`cmdf()` arguments were formatted as integers~~ — a float
+      argument is now sent as a decimal number (`%.7g`), via the
+      `CMDCALLM`/`CMDCALLMF` float-mask opcodes. Syscall arguments are still
+      untyped (above).
 - [ ] Neither syscalls nor `cmd()` type-check arguments — the compiler
       pushes whatever an expression evaluates to; the receiving syscall/
       command decides how to interpret it. A script can pass a float

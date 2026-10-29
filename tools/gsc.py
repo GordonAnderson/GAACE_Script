@@ -93,6 +93,10 @@ cmd() -- calling into the command processor directly:
     alongside the code (repeated calls to the same name share one copy);
     CMDCALL carries a pool offset, not the string itself, so the VM core
     still touches no strings directly -- see GAACEScript.h.
+  - Arguments are typed by the compiler: an int expression is sent as an
+    integer, a float expression as a decimal number (`cmd("SETV", 23.76)`
+    sends `SETV,23.76`). Calls with a float argument compile to CMDCALLM/
+    CMDCALLMF (a 2-byte float-argument mask, max 16 arguments).
   - Returns an int: the response parsed as a number on ACK, 0 on NAK or if
     the response has no trailing number (e.g. a plain action command with
     no return value). NAK and "ACK with value 0" are not distinguishable
@@ -165,6 +169,8 @@ OP_I2F      = 0x25
 OP_F2I      = 0x26
 OP_CMDCALL  = 0x27
 OP_CMDCALLF = 0x28
+OP_CMDCALLM = 0x29   # + <floatMask:u16>: bit i set => arg i is a float
+OP_CMDCALLMF = 0x2A
 
 VAR_SLOTS = 16
 
@@ -889,11 +895,20 @@ class Codegen:
                 raise CompileError("string pool too large (over 65535 bytes)")
             if len(expr.args) > 0xFF:
                 raise CompileError(f"cmd({expr.cmd_name!r}, ...) has too many arguments")
-            for a in expr.args:
-                self.gen_expr(a)
-            self.emit(OP_CMDCALLF if expr.is_float else OP_CMDCALL)
+            if len(expr.args) > 16:
+                raise CompileError(f"cmd({expr.cmd_name!r}, ...) has more than 16 arguments")
+            mask = 0
+            for i, a in enumerate(expr.args):
+                if self.gen_expr(a) == "float":
+                    mask |= 1 << i
+            if mask:
+                self.emit(OP_CMDCALLMF if expr.is_float else OP_CMDCALLM)
+            else:
+                self.emit(OP_CMDCALLF if expr.is_float else OP_CMDCALL)
             self.buf += offset.to_bytes(2, "little")
             self.emit(len(expr.args))
+            if mask:
+                self.buf += mask.to_bytes(2, "little")
             return "float" if expr.is_float else "int"
 
         raise CompileError(f"internal error: unknown expression {expr!r}")
@@ -977,10 +992,12 @@ _OPNAMES = {
     OP_FDIV: "FDIV", OP_FNEG: "FNEG", OP_FEQ: "FEQ", OP_FNE: "FNE",
     OP_FLT: "FLT", OP_FLE: "FLE", OP_FGT: "FGT", OP_FGE: "FGE",
     OP_I2F: "I2F", OP_F2I: "F2I", OP_CMDCALL: "CMDCALL", OP_CMDCALLF: "CMDCALLF",
+    OP_CMDCALLM: "CMDCALLM", OP_CMDCALLMF: "CMDCALLMF",
 }
 _OPERAND_LEN = {
     OP_PUSH_I32: 4, OP_PUSH_F32: 4, OP_LOAD: 1, OP_STORE: 1,
     OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2, OP_CMDCALL: 3, OP_CMDCALLF: 3,
+    OP_CMDCALLM: 5, OP_CMDCALLMF: 5,
 }
 
 
@@ -1012,12 +1029,15 @@ def disassemble(code: bytes, pool: bytes = b"") -> str:
             lines.append(f"{pc:4d}: {name} -> {target}")
         elif op == OP_CALL:
             lines.append(f"{pc:4d}: {name} id={code[pc + 1]} argc={code[pc + 2]}")
-        elif op in (OP_CMDCALL, OP_CMDCALLF):
+        elif op in (OP_CMDCALL, OP_CMDCALLF, OP_CMDCALLM, OP_CMDCALLMF):
             offset = int.from_bytes(code[pc + 1:pc + 3], "little")
             argc = code[pc + 3]
             name_str = _pool_string_at(pool, offset)
             label = f'"{name_str}"' if name_str is not None else f"offset={offset}"
-            lines.append(f"{pc:4d}: {name} {label} argc={argc}")
+            extra_txt = ""
+            if op in (OP_CMDCALLM, OP_CMDCALLMF):
+                extra_txt = f" floatmask=0x{int.from_bytes(code[pc + 4:pc + 6], 'little'):04x}"
+            lines.append(f"{pc:4d}: {name} {label} argc={argc}{extra_txt}")
         else:
             lines.append(f"{pc:4d}: {name}")
         pc += 1 + extra

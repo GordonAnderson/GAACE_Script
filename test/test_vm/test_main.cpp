@@ -356,9 +356,12 @@ static int32_t lastBridgeArgs[4];
 static uint8_t lastBridgeArgc;
 
 static bool lastBridgeWantFloat;
+static uint16_t lastBridgeFloatMask;
 
-static int32_t fakeCmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat) {
+static int32_t fakeCmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat,
+                              uint16_t floatMask) {
   lastBridgeWantFloat = wantFloat;
+  lastBridgeFloatMask = floatMask;
   strncpy(lastBridgeName, name, sizeof(lastBridgeName) - 1);
   lastBridgeName[sizeof(lastBridgeName) - 1] = '\0';
   lastBridgeArgc = argc;
@@ -406,6 +409,41 @@ static void test_cmdcallf_asks_bridge_for_float(void) {
   lastBridgeWantFloat = false;
   TEST_ASSERT_EQUAL(VM_HALTED, vmRun(vm, 100));
   TEST_ASSERT_TRUE(lastBridgeWantFloat);
+}
+
+static void test_cmdcallm_passes_float_mask_to_bridge(void) {
+  static const uint8_t pool[] = "SETV\0";
+  Asm a;
+  a.pushI32(3);
+  a.pushF32(23.76f);
+  a.op(OP_CMDCALLM);
+  a.op(0); a.op(0);      // poolOffset
+  a.op(2);               // argc
+  a.op(0b10); a.op(0);   // floatMask
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetCmdBridge(vm, fakeCmdBridge);
+
+  lastBridgeWantFloat = true;
+  lastBridgeFloatMask = 0;
+  TEST_ASSERT_EQUAL(VM_HALTED, vmRun(vm, 100));
+  TEST_ASSERT_FALSE(lastBridgeWantFloat);
+  TEST_ASSERT_EQUAL_UINT16(0b10, lastBridgeFloatMask);
+  TEST_ASSERT_EQUAL_INT32(3, lastBridgeArgs[0]);
+  TEST_ASSERT_EQUAL_INT32(99, vm.stack[vm.sp - 1]);
+}
+
+static void test_cmdcallmf_wants_float_and_truncated_operand_errors(void) {
+  static const uint8_t pool[] = "GVOLT\0";
+  const uint8_t code[] = { OP_CMDCALLMF, 0, 0, 0, 0 };  // mask's 2nd byte missing
+  VM vm;
+  vmInit(vm, code, sizeof(code));
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetCmdBridge(vm, fakeCmdBridge);
+  TEST_ASSERT_EQUAL(VM_ERR_BAD_JUMP, vmRun(vm, 100));
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +550,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_power_to_drive_example);
   RUN_TEST(test_cmdcall_invokes_bridge_with_name_and_args);
   RUN_TEST(test_cmdcallf_asks_bridge_for_float);
+  RUN_TEST(test_cmdcallm_passes_float_mask_to_bridge);
+  RUN_TEST(test_cmdcallmf_wants_float_and_truncated_operand_errors);
   RUN_TEST(test_syscall_table_hash_matches_shared_vector);
   RUN_TEST(test_syscall_table_hash_empty_table);
   RUN_TEST(test_syscall_table_hash_changes_with_any_difference);
