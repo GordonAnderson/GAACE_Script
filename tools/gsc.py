@@ -28,8 +28,9 @@ Language (informal grammar):
     mul_expr    := unary (("*"|"/"|"%") unary)*
     unary       := ("-"|"!") unary | cast | primary
     cast        := "(" type ")" unary
-    primary     := NUMBER | FLOAT | IDENT | IDENT "(" (expr ("," expr)*)? ")"
-                 | cmd_call | "(" expr ")"
+    primary     := NUMBER | FLOAT | "true" | "false" | IDENT
+                 | IDENT "(" (expr ("," expr)*)? ")" | cmd_call | "(" expr ")"
+                   (true/false are int literals 1/0, e.g. cmd("SADCEN", true))
     cmd_call    := ("cmd" | "cmdf") "(" STRING ("," expr)* ")"
 
 Notes:
@@ -331,7 +332,8 @@ TOKEN_RE = re.compile(r"""
   | (?P<OP>==|!=|<=|>=|&&|\|\||[(){};,=+\-*/%<>!:])
 """, re.VERBOSE)
 
-KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float", "cmd", "cmdf"}
+KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float", "cmd", "cmdf",
+            "true", "false"}
 
 
 class Token:
@@ -598,6 +600,11 @@ class Parser:
         if t.kind == "FLOAT":
             self.advance()
             return Num(float(t.value), is_float=True)
+        if t.kind in ("true", "false"):
+            # Plain int literals 1/0 -- no bool type. Sent by cmd() as "1"/"0",
+            # which GAACE_Core's CMDbool accepts alongside TRUE/FALSE.
+            self.advance()
+            return Num(1 if t.kind == "true" else 0, is_float=False)
         if t.kind == "IDENT":
             self.advance()
             if self.at("("):

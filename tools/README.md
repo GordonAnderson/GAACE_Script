@@ -85,8 +85,14 @@ script can call, with zero per-project wiring (`GAACEScriptRuntime.h`'s
   moment.
 - `cmd()` returns an `int`: the response parsed as a number on ACK, `0` on
   NAK or if the response has no trailing number (e.g. a plain action
-  command with no return value). NAK and "ACK with value 0" aren't
-  distinguishable from the return value alone.
+  command with no return value). A `TRUE`/`FALSE` reply (any case, e.g.
+  from a `CMDbool` getter) comes back as `1`/`0`. NAK, `FALSE` and "ACK
+  with value 0" aren't distinguishable from the return value alone.
+- Bool commands: `true` and `false` are int literals (`1`/`0`), so
+  `cmd("SADCEN", true)` sends `SADCEN,1`. GAACE_Core's `CMDbool` and
+  `STENA` accept `1`/`0` as well as `TRUE`/`FALSE` (GAACE_Core `main`,
+  2026-11-05 or later); a project's own `CMDfunction` bool handler only
+  works from a script if it accepts `1`/`0` too.
 - `cmdf("NAME", args...)` is identical but returns a `float`: the reply is
   parsed as float32, so `"3.14"` comes back as `3.14` instead of `3`. Use
   it for any command whose reply can be fractional (`volts = cmdf("GVOLT",

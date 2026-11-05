@@ -72,6 +72,13 @@ against different syscalls. Open items:
       argument is now sent as a decimal number (`%.7g`), via the
       `CMDCALLM`/`CMDCALLMF` float-mask opcodes. Syscall arguments are still
       untyped (above).
+- [x] ~~`cmd()` couldn't read or set bool (`TRUE`/`FALSE`) commands~~
+      (2026-11-05) — a `TRUE`/`FALSE` reply now comes back as `1`/`0`
+      (was always `0` via `atoi`), and `true`/`false` are int literals
+      sent as `1`/`0`, which GAACE_Core's `CMDbool`/`STENA` now accept.
+      A `FALSE` reply is also indistinguishable from a NAK (above). Not
+      yet run on hardware (`test_cmd_bool_get_and_set` compiles; needs
+      the QT Py).
 - [ ] Neither syscalls nor `cmd()` type-check arguments — the compiler
       pushes whatever an expression evaluates to; the receiving syscall/
       command decides how to interpret it. A script can pass a float

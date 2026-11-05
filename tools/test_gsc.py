@@ -287,6 +287,16 @@ class EndToEndVmTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual([int(l) for l in lines], [1, 2, 3])
 
+    def test_true_false_literals_are_1_and_0(self):
+        status, lines = self.run_script("""
+            syscall print(v) = 0;
+            print(true); print(false);
+            flag = true;
+            if (flag) { print(10); } else { print(20); }
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual([int(l) for l in lines], [1, 0, 10])
+
     def test_logical_and_or_not(self):
         status, lines = self.run_script("""
             syscall print(v) = 0;

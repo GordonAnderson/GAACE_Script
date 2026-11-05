@@ -3,6 +3,7 @@
 #include "GAACEScriptRuntime.h"
 #include "GAACEScriptHex.h"
 #include <Errors.h>
+#include <ctype.h>   // toupper(), isalnum()
 #include <stdio.h>
 #include <stdlib.h>  // atoi(), strtoul()
 #include <string.h>  // memcpy(), strlen()
@@ -31,9 +32,22 @@ static ScriptRuntime *activeInstance = nullptr;
 //
 // Return value: the response parsed as a number on ACK (an int for cmd(), a
 // float32 bit-cast into the int32 for cmdf()), 0 on NAK or a response with
-// no trailing number (e.g. a plain action command). NAK and
+// no trailing number (e.g. a plain action command). A TRUE/FALSE reply (any
+// case, e.g. from a CMDbool getter) comes back as 1/0. NAK, FALSE and
 // "ACK with value 0" are not distinguishable from the return value alone.
 // -----------------------------------------------------------------------
+
+// True if `s` (after leading whitespace) is the word `word`, ignoring case,
+// followed by end of string or a non-alphanumeric character (the reply's
+// line ending), so "TRUE\r\n" matches but "TRUEX" doesn't.
+static bool replyIsWord(const char *s, const char *word) {
+  while (*s == ' ' || *s == '\t') s++;
+  for (; *word != '\0'; s++, word++) {
+    if (toupper((unsigned char)*s) != *word) return false;
+  }
+  return !isalnum((unsigned char)*s);
+}
+
 static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc, bool wantFloat,
                          uint16_t floatMask) {
   commandProcessor &cp = *activeInstance->cp_;
@@ -54,12 +68,19 @@ static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc, bool wan
   cp.executeLine(line, response, sizeof(response));
 
   if ((uint8_t)response[0] != 0x06) return 0;  // NAK (0 / 0.0f both read as 0 bits)
+
+  // Bool replies: atoi("TRUE") would be 0, so map the words explicitly.
+  int boolVal = -1;
+  if      (replyIsWord(response + 1, "TRUE"))  boolVal = 1;
+  else if (replyIsWord(response + 1, "FALSE")) boolVal = 0;
+
   if (wantFloat) {
-    float f = (float)atof(response + 1);
+    float f = (boolVal >= 0) ? (float)boolVal : (float)atof(response + 1);
     int32_t bits;
     memcpy(&bits, &f, sizeof(bits));
     return bits;
   }
+  if (boolVal >= 0) return boolVal;
   return (int32_t)atoi(response + 1);
 }
 

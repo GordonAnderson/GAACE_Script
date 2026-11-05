@@ -159,6 +159,59 @@ static void test_cmd_unknown_command_returns_zero(void) {
 }
 
 // -----------------------------------------------------------------------
+// Bool commands both ways against a real CMDbool: a TRUE/FALSE reply comes
+// back as 1/0 (atoi("TRUE") would be 0), and a script's `false` (sent as
+// "0") sets the bool, which GAACE_Core's CMDbool accepts alongside FALSE.
+// -----------------------------------------------------------------------
+static bool testFlag = false;
+
+static void test_cmd_bool_get_and_set(void) {
+  commandProcessor cp;
+  ThreadController control;
+  ScriptRuntime scripts(&cp, &control);
+
+  MockStream ms;
+  cp.registerStream(&ms);
+  cp.registerCommands(scripts.scriptCmdList());
+
+  Command cmds[] = {
+    {"?FLAG", CMDbool, -1, (void *)&testFlag, NULL, "test"},
+    {NULL}
+  };
+  CommandList list = {cmds, NULL};
+  cp.registerCommands(&list);
+  testFlag = true;
+
+  // gsc.py output for:
+  //   a = cmd("GFLAG"); cmd("SFLAG", false); b = cmd("GFLAG");
+  static uint8_t code[] = {
+    0x27, 0x00, 0x00, 0x00,       // CMDCALL "GFLAG" argc=0
+    0x05, 0x00,                   // STORE a
+    0x01, 0x00, 0x00, 0x00, 0x00, // PUSH_I32 0 (false)
+    0x27, 0x06, 0x00, 0x01,       // CMDCALL "SFLAG" argc=1
+    0x03,                         // POP
+    0x27, 0x00, 0x00, 0x00,       // CMDCALL "GFLAG" argc=0
+    0x05, 0x01,                   // STORE b
+    0x00                          // HALT
+  };
+  static const uint8_t pool[] = "GFLAG\0SFLAG\0";
+
+  ScriptSlot &slot0 = scripts.slots[0];
+  memcpy(slot0.code, code, sizeof(code));
+  slot0.codeLen = sizeof(code);
+  vmInit(slot0.vm, slot0.code, slot0.codeLen);
+  vmSetPool(slot0.vm, pool, sizeof(pool));
+  slot0.loaded = true;
+
+  Status s = vmRun(slot0.vm, 100);
+
+  TEST_ASSERT_EQUAL(VM_HALTED, s);
+  TEST_ASSERT_EQUAL_INT32(1, slot0.vm.vars[0]);  // TRUE -> 1
+  TEST_ASSERT_FALSE(testFlag);                   // "SFLAG,0" took effect
+  TEST_ASSERT_EQUAL_INT32(0, slot0.vm.vars[1]);  // FALSE -> 0
+}
+
+// -----------------------------------------------------------------------
 // SCRIPTLOAD end to end: the hex below is gsc.py's real --scriptload
 // output for `cmd("SFOO", 42);` (verified by hand: 0b00 = codeLen 11,
 // then 11 code bytes, then "SFOO\0"). Proves the [codeLen][code][pool]
@@ -350,6 +403,7 @@ void setup() {
   RUN_TEST(test_cmd_set_reaches_real_command);
   RUN_TEST(test_cmd_get_returns_parsed_value);
   RUN_TEST(test_cmd_unknown_command_returns_zero);
+  RUN_TEST(test_cmd_bool_get_and_set);
   RUN_TEST(test_scriptload_with_pool_end_to_end);
   RUN_TEST(test_register_syscalls_rules);
   RUN_TEST(test_register_syscalls_refused_after_legacy_registration);
