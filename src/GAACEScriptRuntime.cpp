@@ -180,6 +180,17 @@ static void cmdScriptLoad(void) {
   vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
   s.syscallHash = hash;
   s.loaded = true;
+  // A slot's enabled flag (inherited from Thread) defaults true at
+  // construction and is otherwise untouched by this runtime -- so a slot
+  // that has never been disabled before (any slot not previously loaded or
+  // explicitly STENA'd) would start ticking, and so running, within one
+  // scheduling interval of this very ACK, before the caller has had any
+  // chance to inspect or arm it. Confirmed on real hardware: a freshly
+  // uploaded script with a physical side effect (driving a DIO line) fired
+  // on its own within ~1s of SCRIPTLOAD. Disabling here makes "loading
+  // doesn't start it running" (see WORKFLOW.md) actually true regardless of
+  // the slot's prior state; the caller still arms it explicitly via STENA.
+  s.enabled = false;
   s.lastStatus = VM_OK;
   cp.sendACK();
 }
@@ -281,6 +292,7 @@ static void cmdScriptCommit(void) {
   vmSetPool(s.vm, s.code + 2 + codeLen, poolLen);
   s.syscallHash = hash;
   s.loaded = true;
+  s.enabled = false;   // see cmdScriptLoad()'s identical note above
   s.lastStatus = VM_OK;
   cp.sendACK();
 }
