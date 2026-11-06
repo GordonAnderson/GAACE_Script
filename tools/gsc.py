@@ -101,11 +101,11 @@ cmd() -- calling into the command processor directly:
     integer, a float expression as a decimal number (`cmd("SETV", 23.76)`
     sends `SETV,23.76`). Calls with a float argument compile to CMDCALLM/
     CMDCALLMF (a 2-byte float-argument mask, max 16 arguments).
-  - Returns an int: the response parsed as a number on ACK, 0 on NAK or if
-    the response has no trailing number (e.g. a plain action command with
-    no return value). NAK and "ACK with value 0" are not distinguishable
-    from the return value alone -- check what you're calling if that
-    matters.
+  - Returns an int: the response parsed as a number on ACK, 1 for a bare
+    ACK (a set or action command that succeeded), TRUE/FALSE as 1/0, and 0
+    on NAK or if the response's text isn't a number. NAK and "ACK with
+    value 0" are not distinguishable from the return value alone -- check
+    what you're calling if that matters.
   - `cmdf("NAME", args...)` is the same call but returns a float: the
     response is parsed as a float32 (so "3.14" comes back as 3.14, not 3).
     Same NAK/no-number -> 0.0 rule. The script has to pick cmd() vs cmdf()
@@ -125,8 +125,8 @@ Devices -- talking to other instruments by name:
   - `ready(dev)` is 1 if that instrument can be reached right now, else 0.
   - `dcmd(dev, "SRFADRV", 1, v);` sends it a command, formatting arguments
     exactly as cmd() does; `x = dcmdf(dev, "GRFADRV", 1);` reads a float
-    back. Returns follow cmd()'s rules (ACK -> number, TRUE/FALSE -> 1/0,
-    NAK, no reply or not reachable -> 0). The script pauses until the reply
+    back. Returns follow cmd()'s rules (ACK + number -> number, bare ACK ->
+    1, TRUE/FALSE -> 1/0, NAK, no reply or not reachable -> 0). The script pauses until the reply
     arrives; nothing else on the controller waits.
   - Device names go in the same string pool as cmd() names. A script using
     these needs firmware with device support (otherwise it stops with

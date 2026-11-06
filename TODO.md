@@ -65,6 +65,11 @@ against different syscalls. Open items:
 - [ ] `cmd()`'s return value can't distinguish NAK from "ACK with value
       0" — both come back as `0`. A script that needs to know for sure
       has to know which commands it's calling and design around it.
+      **Narrowed (2026-11-05):** a bare ACK (a set or action command that
+      worked) now returns `1` instead of `0`, so the common "did my set
+      work?" case is answered (`ok = cmd("SADCEN", true);`). Only a getter
+      that genuinely returns 0 is still ambiguous with a NAK. Behavior
+      change: a script that relied on a set command returning 0 now sees 1.
 - [x] ~~`cmd()` response parsing is integer-only~~ — `cmd()` still
       returns an int (`atoi`), but `cmdf()` now returns the reply parsed
       as a float32. The script picks which up front.

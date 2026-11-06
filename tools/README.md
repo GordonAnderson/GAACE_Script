@@ -84,10 +84,12 @@ script can call, with zero per-project wiring (`GAACEScriptRuntime.h`'s
   human/PC might be mid-typing into the shared input buffer at that same
   moment.
 - `cmd()` returns an `int`: the response parsed as a number on ACK, `0` on
-  NAK or if the response has no trailing number (e.g. a plain action
-  command with no return value). A `TRUE`/`FALSE` reply (any case, e.g.
-  from a `CMDbool` getter) comes back as `1`/`0`. NAK, `FALSE` and "ACK
-  with value 0" aren't distinguishable from the return value alone.
+  NAK or if the response's text isn't a number. A bare ACK (a set or action
+  command that succeeded, with nothing after the ACK) returns `1`, so
+  `ok = cmd("SADCEN", true);` tells you the set worked. A `TRUE`/`FALSE`
+  reply (any case, e.g. from a `CMDbool` getter) comes back as `1`/`0`.
+  NAK, `FALSE` and "ACK with value 0" aren't distinguishable from the
+  return value alone.
 - Bool commands: `true` and `false` are int literals (`1`/`0`), so
   `cmd("SADCEN", true)` sends `SADCEN,1`. GAACE_Core's `CMDbool` and
   `STENA` accept `1`/`0` as well as `TRUE`/`FALSE` (GAACE_Core `main`,
@@ -124,9 +126,9 @@ if (ready(q) && ready(e)) {
 - `dcmd(dev, "CMD", args...)` sends `CMD,args` to it, formatting arguments
   exactly as `cmd()` does (ints as integers, floats as decimals, `true`/
   `false` as `1`/`0`); `dcmdf(...)` is the same but returns a `float`.
-  Results follow `cmd()`'s rules: ACK + number -> that number, `TRUE`/
-  `FALSE` -> `1`/`0`, and `0` for a bare ACK (a set command), a NAK, no
-  reply, or an instrument that isn't there.
+  Results follow `cmd()`'s rules: ACK + number -> that number, a bare ACK
+  (a set command that worked) -> `1`, `TRUE`/`FALSE` -> `1`/`0`, and `0`
+  for a NAK, no reply, or an instrument that isn't there.
 - The script **pauses** at `dcmd()`/`dcmdf()` until the reply arrives,
   then carries on from that point; nothing else on the controller waits
   (see "Waiting syscalls" in the top-level README).

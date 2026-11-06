@@ -185,7 +185,8 @@ typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc,
 // into a handle (the project decides what a handle is; it's just an int32
 // to the VM), ready() says whether that device can be reached right now
 // (0/1), command() sends it "NAME,args" and returns the reply as cmd()
-// does (ACK -> number, TRUE/FALSE -> 1/0, otherwise 0; a float32 bit
+// does (ACK + number -> number, bare ACK -> 1, TRUE/FALSE -> 1/0,
+// otherwise 0; a float32 bit
 // pattern when wantFloat) -- or, normally, calls vmRequestWait() and lets
 // the project's poll function supply that value when the reply arrives.
 struct DeviceBridge {

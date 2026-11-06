@@ -33,9 +33,11 @@ static ScriptRuntime *activeInstance = nullptr;
 //
 // Return value: the response parsed as a number on ACK (an int for cmd(), a
 // float32 bit-cast into the int32 for cmdf()), 0 on NAK or a response with
-// no trailing number (e.g. a plain action command). A TRUE/FALSE reply (any
-// case, e.g. from a CMDbool getter) comes back as 1/0. NAK, FALSE and
-// "ACK with value 0" are not distinguishable from the return value alone.
+// no trailing number. A bare ACK (a set or action command that succeeded,
+// nothing after the ACK) comes back as 1, so a script can tell a successful
+// set from a NAK. A TRUE/FALSE reply (any case, e.g. from a CMDbool getter)
+// comes back as 1/0. NAK, FALSE and "ACK with value 0" are still not
+// distinguishable from the return value alone.
 // -----------------------------------------------------------------------
 
 // True if `s` (after leading whitespace) is the word `word`, ignoring case,
@@ -70,10 +72,14 @@ static int32_t cmdBridge(const char *name, int32_t *args, uint8_t argc, bool wan
 
   if ((uint8_t)response[0] != 0x06) return 0;  // NAK (0 / 0.0f both read as 0 bits)
 
-  // Bool replies: atoi("TRUE") would be 0, so map the words explicitly.
+  // Bool replies: atoi("TRUE") would be 0, so map the words explicitly. A
+  // bare ACK (nothing but the line ending after it) means "done": 1.
+  const char *v = response + 1;
+  while (*v == ' ' || *v == '\t') v++;
   int boolVal = -1;
-  if      (replyIsWord(response + 1, "TRUE"))  boolVal = 1;
-  else if (replyIsWord(response + 1, "FALSE")) boolVal = 0;
+  if      (*v == '\0' || *v == '\r' || *v == '\n')  boolVal = 1;
+  else if (replyIsWord(response + 1, "TRUE"))        boolVal = 1;
+  else if (replyIsWord(response + 1, "FALSE"))       boolVal = 0;
 
   if (wantFloat) {
     float f = (boolVal >= 0) ? (float)boolVal : (float)atof(response + 1);
