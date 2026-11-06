@@ -533,6 +533,102 @@ static void test_cmdcall_missing_terminator_errors(void) {
   TEST_ASSERT_EQUAL(VM_ERR_BAD_POOL, s);
 }
 
+// ---------------------------------------------------------------------------
+// Waiting syscalls: vmRequestWait() / VM_WAITING / vmResume()
+// ---------------------------------------------------------------------------
+static int waitSyscallCalls = 0;
+static int32_t lastWaitArg = 0;
+
+// Asks to wait with token 1000+arg; its own return value must be ignored.
+static int32_t sys_wait_for(int32_t *args, uint8_t argc) {
+  waitSyscallCalls++;
+  lastWaitArg = args[0];
+  vmRequestWait(1000 + args[0]);
+  return 999;
+}
+
+// v = wait_for(7); w = v + 1; halt   -> pauses after the CALL, resumes with
+// the supplied result, and finishes the script from there.
+static void test_wait_pauses_and_resume_continues(void) {
+  Asm a;
+  a.pushI32(7);
+  a.call(0, 1);
+  a.slotOp(OP_STORE, 0);
+  a.slotOp(OP_LOAD, 0);
+  a.pushI32(1);
+  a.op(OP_ADD);
+  a.slotOp(OP_STORE, 1);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmRegisterSyscall(vm, sys_wait_for);
+  waitSyscallCalls = 0;
+
+  Status s = vmRun(vm, 100);
+  TEST_ASSERT_EQUAL(VM_WAITING, s);
+  TEST_ASSERT_TRUE(vm.paused);
+  TEST_ASSERT_EQUAL_INT32(1007, vm.waitToken);
+  TEST_ASSERT_EQUAL(1, waitSyscallCalls);
+  TEST_ASSERT_EQUAL_INT32(7, lastWaitArg);
+  TEST_ASSERT_EQUAL(0, vm.sp);                  // the ignored 999 was not pushed
+
+  s = vmResume(vm, 41, 100);
+  TEST_ASSERT_EQUAL(VM_HALTED, s);
+  TEST_ASSERT_FALSE(vm.paused);
+  TEST_ASSERT_EQUAL_INT32(41, vm.vars[0]);
+  TEST_ASSERT_EQUAL_INT32(42, vm.vars[1]);
+  TEST_ASSERT_EQUAL(1, waitSyscallCalls);       // not called again on resume
+}
+
+// Two waits in one script: each pauses in turn, results arrive in order.
+static void test_two_waits_in_sequence(void) {
+  Asm a;
+  a.pushI32(1);
+  a.call(0, 1);
+  a.slotOp(OP_STORE, 0);
+  a.pushI32(2);
+  a.call(0, 1);
+  a.slotOp(OP_STORE, 1);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmRegisterSyscall(vm, sys_wait_for);
+
+  TEST_ASSERT_EQUAL(VM_WAITING, vmRun(vm, 100));
+  TEST_ASSERT_EQUAL_INT32(1001, vm.waitToken);
+  TEST_ASSERT_EQUAL(VM_WAITING, vmResume(vm, 10, 100));
+  TEST_ASSERT_EQUAL_INT32(1002, vm.waitToken);
+  TEST_ASSERT_EQUAL(VM_HALTED, vmResume(vm, 20, 100));
+  TEST_ASSERT_EQUAL_INT32(10, vm.vars[0]);
+  TEST_ASSERT_EQUAL_INT32(20, vm.vars[1]);
+}
+
+// vmResume() on a VM that isn't paused is refused and pushes nothing;
+// vmInit() clears a pause; vmRequestWait() outside a syscall is a no-op.
+static void test_resume_without_wait_and_init_clears_pause(void) {
+  Asm a;
+  a.pushI32(3);
+  a.call(0, 1);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmRegisterSyscall(vm, sys_wait_for);
+
+  TEST_ASSERT_EQUAL(VM_ERR_BAD_OPCODE, vmResume(vm, 5, 100));
+  TEST_ASSERT_EQUAL(0, vm.sp);
+
+  TEST_ASSERT_EQUAL(VM_WAITING, vmRun(vm, 100));
+  vmInit(vm, a.buf, a.len);
+  TEST_ASSERT_FALSE(vm.paused);
+  TEST_ASSERT_EQUAL(VM_ERR_BAD_OPCODE, vmResume(vm, 5, 100));
+
+  vmRequestWait(123);                            // no syscall running: ignored
+  TEST_ASSERT_FALSE(vm.waitRequested);
+}
+
 int main(int argc, char **argv) {
   UNITY_BEGIN();
   RUN_TEST(test_arithmetic_and_stack);
@@ -559,5 +655,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_cmdcall_without_bridge_registered_errors);
   RUN_TEST(test_cmdcall_offset_out_of_range_errors);
   RUN_TEST(test_cmdcall_missing_terminator_errors);
+  RUN_TEST(test_wait_pauses_and_resume_continues);
+  RUN_TEST(test_two_waits_in_sequence);
+  RUN_TEST(test_resume_without_wait_and_init_clears_pause);
   return UNITY_END();
 }

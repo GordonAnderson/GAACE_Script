@@ -62,6 +62,9 @@ void vmInit(VM &vm, const uint8_t *code, uint16_t codeLen) {
   vm.codeLen = codeLen;
   vm.pc = 0;
   vm.sp = 0;
+  vm.paused = false;
+  vm.waitRequested = false;
+  vm.waitToken = 0;
   for (uint8_t i = 0; i < VAR_SLOTS; i++) vm.vars[i] = 0;
 }
 
@@ -78,6 +81,16 @@ void vmSetPool(VM &vm, const uint8_t *pool, uint16_t poolLen) {
 
 void vmSetCmdBridge(VM &vm, CmdBridgeFn fn) {
   vm.cmdBridge = fn;
+}
+
+// The VM executing a syscall right now, for vmRequestWait(). vmRun() is not
+// re-entrant, so at most one VM is ever mid-syscall.
+static VM *currentVm = nullptr;
+
+void vmRequestWait(int32_t token) {
+  if (currentVm == nullptr) return;
+  currentVm->waitRequested = true;
+  currentVm->waitToken     = token;
 }
 
 Status vmRun(VM &vm, uint16_t maxSteps) {
@@ -282,10 +295,19 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
           Status s = pop(vm, args[i]);
           if (s != VM_OK) return s;
         }
+        vm.waitRequested = false;
+        currentVm = &vm;
         int32_t r = vm.syscalls[id](args, argc);
+        currentVm = nullptr;
+        vm.pc += 3;
+        if (vm.waitRequested) {
+          // Result comes later via vmResume(); nothing is pushed now.
+          vm.waitRequested = false;
+          vm.paused = true;
+          return VM_WAITING;
+        }
         Status s = push(vm, r);
         if (s != VM_OK) return s;
-        vm.pc += 3;
         break;
       }
 
@@ -329,6 +351,15 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
     }
   }
   return VM_ERR_STEP_LIMIT;
+}
+
+Status vmResume(VM &vm, int32_t result, uint16_t maxSteps) {
+  if (!vm.paused) return VM_ERR_BAD_OPCODE;
+  vm.paused = false;
+  vm.waitToken = 0;
+  Status s = push(vm, result);
+  if (s != VM_OK) return s;
+  return vmRun(vm, maxSteps);
 }
 
 } // namespace GAACEScript

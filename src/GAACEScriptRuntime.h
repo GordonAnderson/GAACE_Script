@@ -197,12 +197,28 @@ public:
 
   CommandList *scriptCmdList(void);
 
+  // Waiting syscalls (GAACEScript.h: vmRequestWait()/vmResume()). A
+  // project whose syscalls can wait registers one poll function: given a
+  // token a syscall passed to vmRequestWait(), return true and fill
+  // *result once that result is ready, false while it isn't. poll() --
+  // call it every pass of loop() -- resumes each enabled, waiting slot
+  // whose result is ready, right away rather than on its next tick. While
+  // a slot waits, its periodic run() does nothing (it isn't restarted).
+  // GSCRIPTST reports a waiting slot's status as VM_WAITING. A slot that is
+  // disabled (STENA) while waiting stays paused until re-enabled; reloading
+  // it (SCRIPTLOAD/SCRIPTCOMMIT) abandons the wait, so the project's poll
+  // function must not rely on every token being collected.
+  typedef bool (*WaitPollFn)(int32_t token, int32_t *result);
+  void setWaitPoll(WaitPollFn fn);
+  void poll(void);
+
   commandProcessor *cp_;  // used by the file-scope command handlers (see .cpp)
 
   // State for GSYSCALLS / the optional <hash> check; set by registerSyscalls().
   const SyscallDesc *syscallTable_ = nullptr;
   uint8_t            syscallCount_ = 0;
   uint32_t           syscallHash_  = 0;
+  WaitPollFn         waitPoll_     = nullptr;
 };
 
 } // namespace GAACEScript

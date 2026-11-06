@@ -206,6 +206,38 @@ save/load/load-on-boot idea for platforms that have one), and a general
 "device just rebooted" notification (a GAACE_Core-level concern, not
 specific to this module).
 
+### Waiting syscalls
+
+A syscall whose result isn't ready yet, for example one that sent a
+command to another device and needs its reply, can pause the script
+instead of blocking the firmware:
+
+```cpp
+static int32_t sys_ask(int32_t *args, uint8_t argc) {
+  int32_t token = startRequest(args[0]);   // project-defined
+  vmRequestWait(token);                     // result comes later
+  return 0;                                 // ignored when waiting
+}
+
+static bool waitPoll(int32_t token, int32_t *result) {
+  return requestDone(token, result);        // true once the result is in
+}
+
+scripts.setWaitPoll(waitPoll);   // once, in setup()
+scripts.poll();                  // every pass of loop()
+```
+
+The VM stops right after that call with status `VM_WAITING`, keeping its
+place, stack and variables, and nothing else in the firmware waits.
+`poll()` asks the project's poll function about each waiting slot and,
+once the result is in, resumes the script from where it stopped, as if
+the syscall had returned that result. To the script it looks like an
+ordinary call that takes a while. A waiting slot's periodic tick doesn't
+restart it. Disabling a slot (`STENA`) keeps it paused until re-enabled;
+reloading a slot abandons the wait. `GSCRIPTST` reports a waiting slot's
+status as `VM_WAITING` (11). Lower level: `vmRequestWait()`/`vmResume()`
+in `GAACEScript.h`.
+
 ## Layout
 
 ```

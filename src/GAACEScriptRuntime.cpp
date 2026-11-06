@@ -13,6 +13,7 @@ namespace GAACEScript {
 void ScriptSlot::run() {
   runned();  // required by Thread's contract when overriding run() (see Thread.h)
   if (!loaded) return;
+  if (vm.paused) return;  // waiting on a syscall's result: ScriptRuntime::poll() resumes it
   vm.pc = 0;
   vm.sp = 0;  // rerun without vmInit(): var-declared slots persist across ticks
   lastStatus = vmRun(vm, maxSteps);
@@ -404,6 +405,23 @@ static CommandList scriptCmdListNode = {scriptCmds, NULL};
 
 CommandList *ScriptRuntime::scriptCmdList(void) {
   return &scriptCmdListNode;
+}
+
+// -----------------------------------------------------------------------
+// Waiting syscalls -- see GAACEScript.h (vmRequestWait()/vmResume()) and
+// the header's poll() comment.
+// -----------------------------------------------------------------------
+void ScriptRuntime::setWaitPoll(WaitPollFn fn) { waitPoll_ = fn; }
+
+void ScriptRuntime::poll(void) {
+  if (waitPoll_ == nullptr) return;
+  for (uint8_t i = 0; i < SCRIPT_SLOTS; i++) {
+    ScriptSlot &s = slots[i];
+    if (!s.loaded || !s.vm.paused || !s.isEnabled()) continue;
+    int32_t result;
+    if (!waitPoll_(s.vm.waitToken, &result)) continue;
+    s.lastStatus = vmResume(s.vm, result, s.maxSteps);
+  }
 }
 
 } // namespace GAACEScript

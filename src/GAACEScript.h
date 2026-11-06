@@ -114,6 +114,11 @@ enum Status : uint8_t {
                            // string at that offset isn't NUL-terminated
                            // within the pool
   VM_ERR_NO_CMD_BRIDGE,    // CMDCALL used but vmSetCmdBridge() was never called
+  VM_WAITING,              // paused inside a syscall that called vmRequestWait();
+                           // vmResume() supplies its result and continues.
+                           // Not an error. (Appended last so the numeric
+                           // values of the statuses above, which GSCRIPTST
+                           // reports, don't change.)
 };
 
 // Overridable per project (e.g. -D GAACE_SCRIPT_STACK_SIZE=64 in
@@ -201,6 +206,11 @@ struct VM {
   const uint8_t *pool = nullptr;
   uint16_t poolLen = 0;
   CmdBridgeFn cmdBridge = nullptr;
+
+  // Waiting syscalls (see vmRequestWait() below).
+  bool    waitRequested = false;  // set by vmRequestWait() during a syscall
+  bool    paused        = false;  // stopped with VM_WAITING; vmResume() continues
+  int32_t waitToken     = 0;      // the token of the wait in progress
 };
 
 // Resets pc/stack/vars and points the VM at a bytecode buffer. Does not
@@ -231,5 +241,30 @@ void vmSetCmdBridge(VM &vm, CmdBridgeFn fn);
 // step budget; VM_ERR_STEP_LIMIT means it didn't, which for a bounded
 // control script is a bug in the script, not a VM fault.
 Status vmRun(VM &vm, uint16_t maxSteps);
+
+// ---------------------------------------------------------------------------
+// Waiting syscalls
+//
+// A syscall whose result isn't available yet (e.g. it sent a command to a
+// downstream device and the reply hasn't arrived) calls vmRequestWait()
+// before returning. Its return value is then ignored: the VM stops right
+// after that CALL, leaves pc/sp/vars intact, stores `token` in
+// vm.waitToken, sets vm.paused, and vmRun() returns VM_WAITING. Nothing
+// else blocks. When the result is ready, vmResume() pushes it (as if the
+// syscall had returned it) and carries on running the script from there.
+//
+// `token` is whatever the embedding project uses to find the pending
+// result later (e.g. a request id); the VM only stores it.
+//
+// vmRequestWait() acts on the VM currently executing a syscall (vmRun() is
+// not re-entrant and runs one VM at a time); calling it outside a syscall
+// does nothing. vmInit() clears any pause.
+// ---------------------------------------------------------------------------
+void vmRequestWait(int32_t token);
+
+// Pushes `result` for the syscall that requested the wait and continues
+// running for up to maxSteps instructions. Returns VM_ERR_BAD_OPCODE if
+// the VM wasn't paused (nothing is pushed in that case).
+Status vmResume(VM &vm, int32_t result, uint16_t maxSteps);
 
 } // namespace GAACEScript
