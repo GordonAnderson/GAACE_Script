@@ -106,6 +106,35 @@ script can call, with zero per-project wiring (`GAACEScriptRuntime.h`'s
   `SCRIPTLOAD`, or use `--format carray` to get both as separate arrays for
   hand-written `vmInit()`/`vmSetPool()` calls.
 
+### Devices — talking to other instruments by name
+
+```
+q = device("QUAD");                 // handle for the instrument named QUAD
+e = device("IsoElectrometer");
+if (ready(q) && ready(e)) {
+    v = dcmdf(q, "GRFADRV", 1);     // read a value from one instrument
+    dcmd(e, "SVOLT", 2, v * 0.5);   // set a value on another
+}
+```
+
+- `device("NAME")` returns a handle (an `int`). What a name means is up to
+  the firmware: on the USBrepeater it's the instrument's `GNAME`, and the
+  handle follows the instrument if it's moved to another connector.
+- `ready(dev)` is `1` if the instrument can be reached right now, else `0`.
+- `dcmd(dev, "CMD", args...)` sends `CMD,args` to it, formatting arguments
+  exactly as `cmd()` does (ints as integers, floats as decimals, `true`/
+  `false` as `1`/`0`); `dcmdf(...)` is the same but returns a `float`.
+  Results follow `cmd()`'s rules: ACK + number -> that number, `TRUE`/
+  `FALSE` -> `1`/`0`, and `0` for a bare ACK (a set command), a NAK, no
+  reply, or an instrument that isn't there.
+- The script **pauses** at `dcmd()`/`dcmdf()` until the reply arrives,
+  then carries on from that point; nothing else on the controller waits
+  (see "Waiting syscalls" in the top-level README).
+- Use single-line commands: the reply is taken to end at its first line.
+- These are built-ins, not syscalls, so they don't change the syscall
+  table hash. Firmware without device support stops such a script with
+  `VM_ERR_NO_DEVICE_BRIDGE` (status 12).
+
 ### The string pool: how `cmd()`/`cmdf()` carry command names
 
 Bytecode can only hold 4-byte numbers, so a command name like `"SADCPIN"`

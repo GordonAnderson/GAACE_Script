@@ -30,6 +30,9 @@ namespace GAACEScript {
 //       is a float32 and the bridge formats it as a decimal number, not as
 //       its raw bit pattern. The compiler emits these only when a call has
 //       at least one float argument; all-int calls keep the 4-byte form.)
+//   OP_DEVICE   <poolOffset:u16>          3 bytes total
+//   OP_DCMDCALL / OP_DCMDCALLF <poolOffset:u16> <argc> <floatMask:u16>
+//                                         6 bytes total (always masked)
 //   everything else                      1 byte (no operand)
 //
 // Floats: a stack/variable slot is just 4 bytes with no type tag anywhere --
@@ -51,6 +54,19 @@ namespace GAACEScript {
 // hardware-specific code -- it hands (name, args, argc) to a single
 // registered CmdBridgeFn and pushes back whatever int32 comes out. See
 // GAACEScriptRuntime.h for the real bridge (into commandProcessor).
+//
+// DEVICE / DREADY / DCMDCALL(F): named remote devices -- e.g. other
+// instruments a controller talks to. The script names a device and gets a
+// handle (`dev = device("QUAD");`), asks whether it can be reached
+// (`ready(dev)`), and sends it a command (`dcmd(dev, "SRFADRV", 1, v)`,
+// `x = dcmdf(dev, "GRFADRV", 1)`). The VM hands these to a DeviceBridge the
+// embedding project registers (vmSetDeviceBridge()); what a handle means and
+// how a command reaches the device is entirely the project's business. A
+// device command normally can't answer on the spot, so the bridge's
+// command() usually calls vmRequestWait() and the script pauses until the
+// reply is in (see "Waiting syscalls" below). Stack for DCMDCALL: the
+// handle, then argc arguments (handle deepest). floatMask/wantFloat mean
+// the same as for CMDCALLM/CMDCALLMF.
 // ---------------------------------------------------------------------------
 enum Opcode : uint8_t {
   OP_HALT = 0x00,
@@ -96,6 +112,10 @@ enum Opcode : uint8_t {
   OP_CMDCALLF,  // same as CMDCALL, but asks the bridge for a float32 result
   OP_CMDCALLM,  // CMDCALL with a float-argument mask (see header comment)
   OP_CMDCALLMF, // CMDCALLF with a float-argument mask
+  OP_DEVICE,    // push DeviceBridge::lookup(pool string)
+  OP_DREADY,    // pop handle; push DeviceBridge::ready(handle)
+  OP_DCMDCALL,  // pop argc args + handle; push DeviceBridge::command(...) (may wait)
+  OP_DCMDCALLF, // same, asking for a float32 result
 };
 
 enum Status : uint8_t {
@@ -119,6 +139,8 @@ enum Status : uint8_t {
                            // Not an error. (Appended last so the numeric
                            // values of the statuses above, which GSCRIPTST
                            // reports, don't change.)
+  VM_ERR_NO_DEVICE_BRIDGE, // DEVICE/DREADY/DCMDCALL used but vmSetDeviceBridge()
+                           // was never called (firmware without device support)
 };
 
 // Overridable per project (e.g. -D GAACE_SCRIPT_STACK_SIZE=64 in
@@ -158,6 +180,20 @@ typedef int32_t (*SyscallFn)(int32_t *args, uint8_t argc);
 // an integer. 0 for plain CMDCALL/CMDCALLF.
 typedef int32_t (*CmdBridgeFn)(const char *name, int32_t *args, uint8_t argc,
                                bool wantFloat, uint16_t floatMask);
+
+// The device bridge (DEVICE/DREADY/DCMDCALL above). lookup() turns a name
+// into a handle (the project decides what a handle is; it's just an int32
+// to the VM), ready() says whether that device can be reached right now
+// (0/1), command() sends it "NAME,args" and returns the reply as cmd()
+// does (ACK -> number, TRUE/FALSE -> 1/0, otherwise 0; a float32 bit
+// pattern when wantFloat) -- or, normally, calls vmRequestWait() and lets
+// the project's poll function supply that value when the reply arrives.
+struct DeviceBridge {
+  int32_t (*lookup)(const char *name);
+  int32_t (*ready)(int32_t handle);
+  int32_t (*command)(int32_t handle, const char *name, int32_t *args, uint8_t argc,
+                     bool wantFloat, uint16_t floatMask);
+};
 
 // ---------------------------------------------------------------------------
 // Syscall descriptor table
@@ -206,6 +242,7 @@ struct VM {
   const uint8_t *pool = nullptr;
   uint16_t poolLen = 0;
   CmdBridgeFn cmdBridge = nullptr;
+  const DeviceBridge *deviceBridge = nullptr;
 
   // Waiting syscalls (see vmRequestWait() below).
   bool    waitRequested = false;  // set by vmRequestWait() during a syscall
@@ -234,6 +271,10 @@ void vmSetPool(VM &vm, const uint8_t *pool, uint16_t poolLen);
 // Registers the single CMDCALL bridge for this VM instance (see
 // CmdBridgeFn above). Not touched by vmInit()/vmSetPool().
 void vmSetCmdBridge(VM &vm, CmdBridgeFn fn);
+
+// Registers the device bridge (DEVICE/DREADY/DCMDCALL). `bridge` must
+// outlive the VM. Not touched by vmInit()/vmSetPool().
+void vmSetDeviceBridge(VM &vm, const DeviceBridge *bridge);
 
 // Runs up to maxSteps instructions. Intended to be called from a
 // cooperative scheduler (e.g. ArduinoThread) the same way ADCThread runs

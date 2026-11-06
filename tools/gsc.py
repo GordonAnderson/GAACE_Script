@@ -32,6 +32,9 @@ Language (informal grammar):
                  | IDENT "(" (expr ("," expr)*)? ")" | cmd_call | "(" expr ")"
                    (true/false are int literals 1/0, e.g. cmd("SADCEN", true))
     cmd_call    := ("cmd" | "cmdf") "(" STRING ("," expr)* ")"
+                 | "device" "(" STRING ")"
+                 | "ready" "(" expr ")"
+                 | ("dcmd" | "dcmdf") "(" expr "," STRING ("," expr)* ")"
 
 Notes:
   - Two numeric types: `int` (int32) and `float` (IEEE754 float32) — see
@@ -114,6 +117,21 @@ cmd() -- calling into the command processor directly:
     artifact (the pool) alongside the code -- see gsc.py's --format
     handling and tools/README.md.
 
+Devices -- talking to other instruments by name:
+  - `dev = device("QUAD");` gives a handle for the instrument whose name is
+    QUAD (how names are found is up to the firmware; on the USBrepeater it's
+    each instrument's GNAME). The handle follows the instrument, so it still
+    works if it's unplugged and plugged into another connector.
+  - `ready(dev)` is 1 if that instrument can be reached right now, else 0.
+  - `dcmd(dev, "SRFADRV", 1, v);` sends it a command, formatting arguments
+    exactly as cmd() does; `x = dcmdf(dev, "GRFADRV", 1);` reads a float
+    back. Returns follow cmd()'s rules (ACK -> number, TRUE/FALSE -> 1/0,
+    NAK, no reply or not reachable -> 0). The script pauses until the reply
+    arrives; nothing else on the controller waits.
+  - Device names go in the same string pool as cmd() names. A script using
+    these needs firmware with device support (otherwise it stops with
+    VM_ERR_NO_DEVICE_BRIDGE); the syscall-table hash is unaffected.
+
 Output formats: raw binary, ASCII hex, or a C uint8_t array body suitable for
 pasting into firmware source. --upload sends the compiled script straight to
 a running controller's control port via SCRIPTLOAD (see WORKFLOW.md).
@@ -172,6 +190,10 @@ OP_CMDCALL  = 0x27
 OP_CMDCALLF = 0x28
 OP_CMDCALLM = 0x29   # + <floatMask:u16>: bit i set => arg i is a float
 OP_CMDCALLMF = 0x2A
+OP_DEVICE    = 0x2B   # <poolOffset:u16>
+OP_DREADY    = 0x2C
+OP_DCMDCALL  = 0x2D   # <poolOffset:u16> <argc> <floatMask:u16>; stack: handle, args
+OP_DCMDCALLF = 0x2E
 
 VAR_SLOTS = 16
 
@@ -333,7 +355,7 @@ TOKEN_RE = re.compile(r"""
 """, re.VERBOSE)
 
 KEYWORDS = {"if", "else", "while", "syscall", "var", "int", "float", "cmd", "cmdf",
-            "true", "false"}
+            "true", "false", "device", "ready", "dcmd", "dcmdf"}
 
 
 class Token:
@@ -397,6 +419,16 @@ class Call:
 class CmdCall:
     def __init__(self, cmd_name, args, is_float=False):
         self.cmd_name, self.args, self.is_float = cmd_name, args, is_float
+
+class DeviceRef:
+    def __init__(self, name): self.name = name
+
+class Ready:
+    def __init__(self, dev): self.dev = dev
+
+class DcmdCall:
+    def __init__(self, dev, cmd_name, args, is_float=False):
+        self.dev, self.cmd_name, self.args, self.is_float = dev, cmd_name, args, is_float
 
 class UnOp:
     def __init__(self, op, operand): self.op, self.operand = op, operand
@@ -628,6 +660,30 @@ class Parser:
                 args.append(self.parse_expr())
             self.expect(")")
             return CmdCall(name_tok.value, args, is_float=(t.kind == "cmdf"))
+        if t.kind == "device":
+            self.advance()
+            self.expect("(")
+            name_tok = self.expect("STRING")
+            self.expect(")")
+            return DeviceRef(name_tok.value)
+        if t.kind == "ready":
+            self.advance()
+            self.expect("(")
+            dev = self.parse_expr()
+            self.expect(")")
+            return Ready(dev)
+        if t.kind in ("dcmd", "dcmdf"):
+            self.advance()
+            self.expect("(")
+            dev = self.parse_expr()
+            self.expect(",")
+            name_tok = self.expect("STRING")
+            args = []
+            while self.at(","):
+                self.advance()
+                args.append(self.parse_expr())
+            self.expect(")")
+            return DcmdCall(dev, name_tok.value, args, is_float=(t.kind == "dcmdf"))
         if t.kind == "(":
             self.advance()
             e = self.parse_expr()
@@ -744,6 +800,10 @@ class Codegen:
                 raise CompileError(f"call to undeclared syscall '{expr.name}'")
             return self.syscalls[expr.name][2]
         if isinstance(expr, CmdCall):
+            return "float" if expr.is_float else "int"
+        if isinstance(expr, (DeviceRef, Ready)):
+            return "int"
+        if isinstance(expr, DcmdCall):
             return "float" if expr.is_float else "int"
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
@@ -918,6 +978,38 @@ class Codegen:
                 self.buf += mask.to_bytes(2, "little")
             return "float" if expr.is_float else "int"
 
+        if isinstance(expr, DeviceRef):
+            offset = self.pool_offset_for(expr.name)
+            if offset > 0xFFFF:
+                raise CompileError("string pool too large (over 65535 bytes)")
+            self.emit(OP_DEVICE)
+            self.buf += offset.to_bytes(2, "little")
+            return "int"
+
+        if isinstance(expr, Ready):
+            if self.gen_expr(expr.dev) != "int":
+                raise CompileError("ready() takes a device handle (an int, from device())")
+            self.emit(OP_DREADY)
+            return "int"
+
+        if isinstance(expr, DcmdCall):
+            offset = self.pool_offset_for(expr.cmd_name)
+            if offset > 0xFFFF:
+                raise CompileError("string pool too large (over 65535 bytes)")
+            if len(expr.args) > 16:
+                raise CompileError(f"dcmd(..., {expr.cmd_name!r}, ...) has more than 16 arguments")
+            if self.gen_expr(expr.dev) != "int":
+                raise CompileError("dcmd()'s first argument is a device handle (an int, from device())")
+            mask = 0
+            for i, a in enumerate(expr.args):
+                if self.gen_expr(a) == "float":
+                    mask |= 1 << i
+            self.emit(OP_DCMDCALLF if expr.is_float else OP_DCMDCALL)
+            self.buf += offset.to_bytes(2, "little")
+            self.emit(len(expr.args))
+            self.buf += mask.to_bytes(2, "little")
+            return "float" if expr.is_float else "int"
+
         raise CompileError(f"internal error: unknown expression {expr!r}")
 
 
@@ -1000,11 +1092,12 @@ _OPNAMES = {
     OP_FLT: "FLT", OP_FLE: "FLE", OP_FGT: "FGT", OP_FGE: "FGE",
     OP_I2F: "I2F", OP_F2I: "F2I", OP_CMDCALL: "CMDCALL", OP_CMDCALLF: "CMDCALLF",
     OP_CMDCALLM: "CMDCALLM", OP_CMDCALLMF: "CMDCALLMF",
+    OP_DEVICE: "DEVICE", OP_DREADY: "DREADY", OP_DCMDCALL: "DCMDCALL", OP_DCMDCALLF: "DCMDCALLF",
 }
 _OPERAND_LEN = {
     OP_PUSH_I32: 4, OP_PUSH_F32: 4, OP_LOAD: 1, OP_STORE: 1,
     OP_JMP: 2, OP_JZ: 2, OP_JNZ: 2, OP_CALL: 2, OP_CMDCALL: 3, OP_CMDCALLF: 3,
-    OP_CMDCALLM: 5, OP_CMDCALLMF: 5,
+    OP_CMDCALLM: 5, OP_CMDCALLMF: 5, OP_DEVICE: 2, OP_DCMDCALL: 5, OP_DCMDCALLF: 5,
 }
 
 
@@ -1045,6 +1138,17 @@ def disassemble(code: bytes, pool: bytes = b"") -> str:
             if op in (OP_CMDCALLM, OP_CMDCALLMF):
                 extra_txt = f" floatmask=0x{int.from_bytes(code[pc + 4:pc + 6], 'little'):04x}"
             lines.append(f"{pc:4d}: {name} {label} argc={argc}{extra_txt}")
+        elif op == OP_DEVICE:
+            offset = int.from_bytes(code[pc + 1:pc + 3], "little")
+            name_str = _pool_string_at(pool, offset)
+            lines.append(f'{pc:4d}: {name} "{name_str}"' if name_str is not None
+                         else f"{pc:4d}: {name} offset={offset}")
+        elif op in (OP_DCMDCALL, OP_DCMDCALLF):
+            offset = int.from_bytes(code[pc + 1:pc + 3], "little")
+            name_str = _pool_string_at(pool, offset)
+            label = f'"{name_str}"' if name_str is not None else f"offset={offset}"
+            mask = int.from_bytes(code[pc + 4:pc + 6], "little")
+            lines.append(f"{pc:4d}: {name} {label} argc={code[pc + 3]} floatmask=0x{mask:04x}")
         else:
             lines.append(f"{pc:4d}: {name}")
         pc += 1 + extra

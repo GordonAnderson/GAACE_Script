@@ -83,6 +83,21 @@ void vmSetCmdBridge(VM &vm, CmdBridgeFn fn) {
   vm.cmdBridge = fn;
 }
 
+void vmSetDeviceBridge(VM &vm, const DeviceBridge *bridge) {
+  vm.deviceBridge = bridge;
+}
+
+// The NUL-terminated pool string at `offset`, or nullptr if the offset is
+// out of range or the string has no terminator within the pool (a bounded
+// scan, so a corrupt pool is reported rather than walked off the end).
+static const char *poolString(const VM &vm, uint16_t offset) {
+  if (offset >= vm.poolLen) return nullptr;
+  uint16_t end = offset;
+  while (end < vm.poolLen && vm.pool[end] != '\0') end++;
+  if (end >= vm.poolLen) return nullptr;
+  return (const char *)&vm.pool[offset];
+}
+
 // The VM executing a syscall right now, for vmRequestWait(). vmRun() is not
 // re-entrant, so at most one VM is ever mid-syscall.
 static VM *currentVm = nullptr;
@@ -343,6 +358,62 @@ Status vmRun(VM &vm, uint16_t maxSteps) {
         Status s = push(vm, r);
         if (s != VM_OK) return s;
         vm.pc += instrLen;
+        break;
+      }
+
+      case OP_DEVICE: {
+        if ((uint32_t)vm.pc + 3 > vm.codeLen) return VM_ERR_BAD_JUMP;
+        if (vm.deviceBridge == nullptr) return VM_ERR_NO_DEVICE_BRIDGE;
+        const char *name = poolString(vm, readU16(&vm.code[vm.pc + 1]));
+        if (name == nullptr) return VM_ERR_BAD_POOL;
+        Status s = push(vm, vm.deviceBridge->lookup(name));
+        if (s != VM_OK) return s;
+        vm.pc += 3;
+        break;
+      }
+
+      case OP_DREADY: {
+        if (vm.deviceBridge == nullptr) return VM_ERR_NO_DEVICE_BRIDGE;
+        int32_t handle;
+        Status s = pop(vm, handle);
+        if (s != VM_OK) return s;
+        s = push(vm, vm.deviceBridge->ready(handle));
+        if (s != VM_OK) return s;
+        vm.pc += 1;
+        break;
+      }
+
+      case OP_DCMDCALL:
+      case OP_DCMDCALLF: {
+        if ((uint32_t)vm.pc + 6 > vm.codeLen) return VM_ERR_BAD_JUMP;
+        if (vm.deviceBridge == nullptr) return VM_ERR_NO_DEVICE_BRIDGE;
+        const char *name = poolString(vm, readU16(&vm.code[vm.pc + 1]));
+        if (name == nullptr) return VM_ERR_BAD_POOL;
+        uint8_t  argc      = vm.code[vm.pc + 3];
+        uint16_t floatMask = readU16(&vm.code[vm.pc + 4]);
+        if ((uint16_t)argc + 1 > vm.sp) return VM_ERR_STACK_UNDERFLOW;
+        int32_t args[STACK_SIZE];
+        for (int8_t i = (int8_t)argc - 1; i >= 0; i--) {
+          Status s = pop(vm, args[i]);
+          if (s != VM_OK) return s;
+        }
+        int32_t handle;
+        Status s = pop(vm, handle);
+        if (s != VM_OK) return s;
+
+        vm.waitRequested = false;
+        currentVm = &vm;
+        int32_t r = vm.deviceBridge->command(handle, name, args, argc,
+                                             op == OP_DCMDCALLF, floatMask);
+        currentVm = nullptr;
+        vm.pc += 6;
+        if (vm.waitRequested) {
+          vm.waitRequested = false;
+          vm.paused = true;
+          return VM_WAITING;
+        }
+        s = push(vm, r);
+        if (s != VM_OK) return s;
         break;
       }
 

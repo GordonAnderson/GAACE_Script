@@ -629,6 +629,78 @@ static void test_resume_without_wait_and_init_clears_pause(void) {
   TEST_ASSERT_FALSE(vm.waitRequested);
 }
 
+// ---------------------------------------------------------------------------
+// Device built-ins: DEVICE / DREADY / DCMDCALL(F) through a DeviceBridge
+// ---------------------------------------------------------------------------
+static char    lastDevCmd[16];
+static int32_t lastDevHandle = 0;
+static int32_t lastDevArg0   = 0;
+static uint16_t lastDevMask  = 0;
+
+static int32_t dev_lookup(const char *name) { return strcmp(name, "QUAD") == 0 ? 3 : 0; }
+static int32_t dev_ready(int32_t h) { return h == 3 ? 1 : 0; }
+static int32_t dev_command(int32_t h, const char *name, int32_t *args, uint8_t argc,
+                           bool wantFloat, uint16_t floatMask) {
+  lastDevHandle = h;
+  strncpy(lastDevCmd, name, sizeof(lastDevCmd) - 1);
+  lastDevArg0 = argc > 0 ? args[0] : 0;
+  lastDevMask = floatMask;
+  vmRequestWait(500 + h);   // the reply arrives later
+  return 0;
+}
+static const DeviceBridge testDevBridge = { dev_lookup, dev_ready, dev_command };
+
+// q = device("QUAD"); v = dcmdf(q, "GV", 2.0); halt  -> waits inside DCMDCALLF,
+// resumes with the float result.
+static void test_device_command_waits_and_resumes(void) {
+  static const uint8_t pool[] = "QUAD\0GV\0";
+  Asm a;
+  a.op(OP_DEVICE); a.buf[a.len++] = 0; a.buf[a.len++] = 0;   // "QUAD"
+  a.slotOp(OP_STORE, 0);
+  a.slotOp(OP_LOAD, 0);
+  a.op(OP_DREADY);
+  a.slotOp(OP_STORE, 2);
+  a.slotOp(OP_LOAD, 0);
+  a.pushF32(2.0f);
+  a.op(OP_DCMDCALLF);
+  a.buf[a.len++] = 5; a.buf[a.len++] = 0;                      // "GV"
+  a.buf[a.len++] = 1;                                          // argc
+  a.buf[a.len++] = 1; a.buf[a.len++] = 0;                      // floatMask: arg0 is float
+  a.slotOp(OP_STORE, 1);
+  a.op(OP_HALT);
+
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  vmSetDeviceBridge(vm, &testDevBridge);
+
+  Status s = vmRun(vm, 100);
+  TEST_ASSERT_EQUAL(VM_WAITING, s);
+  TEST_ASSERT_EQUAL_INT32(3, vm.vars[0]);       // handle from lookup()
+  TEST_ASSERT_EQUAL_INT32(1, vm.vars[2]);       // ready()
+  TEST_ASSERT_EQUAL_INT32(3, lastDevHandle);
+  TEST_ASSERT_EQUAL_STRING("GV", lastDevCmd);
+  TEST_ASSERT_EQUAL_INT32(f32bits(2.0f), lastDevArg0);
+  TEST_ASSERT_EQUAL_UINT16(1, lastDevMask);
+  TEST_ASSERT_EQUAL_INT32(503, vm.waitToken);
+  TEST_ASSERT_EQUAL(0, vm.sp);                  // handle + arg consumed, nothing pushed yet
+
+  s = vmResume(vm, f32bits(7.25f), 100);
+  TEST_ASSERT_EQUAL(VM_HALTED, s);
+  TEST_ASSERT_EQUAL_FLOAT(7.25f, bitsF32(vm.vars[1]));
+}
+
+static void test_device_without_bridge_errors(void) {
+  static const uint8_t pool[] = "QUAD\0";
+  Asm a;
+  a.op(OP_DEVICE); a.buf[a.len++] = 0; a.buf[a.len++] = 0;
+  a.op(OP_HALT);
+  VM vm;
+  vmInit(vm, a.buf, a.len);
+  vmSetPool(vm, pool, sizeof(pool));
+  TEST_ASSERT_EQUAL(VM_ERR_NO_DEVICE_BRIDGE, vmRun(vm, 100));
+}
+
 int main(int argc, char **argv) {
   UNITY_BEGIN();
   RUN_TEST(test_arithmetic_and_stack);
@@ -658,5 +730,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_wait_pauses_and_resume_continues);
   RUN_TEST(test_two_waits_in_sequence);
   RUN_TEST(test_resume_without_wait_and_init_clears_pause);
+  RUN_TEST(test_device_command_waits_and_resumes);
+  RUN_TEST(test_device_without_bridge_errors);
   return UNITY_END();
 }

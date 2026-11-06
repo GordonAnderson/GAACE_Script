@@ -13,6 +13,7 @@ Two layers:
 Run with: python3 -m unittest tools/test_gsc.py -v
 """
 import io
+import re
 import os
 import shutil
 import subprocess
@@ -69,6 +70,23 @@ static int32_t fake_cmd_bridge(const char *name, int32_t *args, uint8_t argc, bo
   return 123;
 }
 
+// Fake device bridge: "QUAD" is handle 7 and reachable, anything else is
+// handle 0 and not. command() prints "DCMD:<handle>:<name>,<args>" and
+// returns 5 (or 2.5 for a float request) without waiting.
+static int32_t fake_dev_lookup(const char *name) { return strcmp(name, "QUAD") == 0 ? 7 : 0; }
+static int32_t fake_dev_ready(int32_t h) { return h == 7 ? 1 : 0; }
+static int32_t fake_dev_command(int32_t h, const char *name, int32_t *args, uint8_t argc,
+                                bool wantFloat, uint16_t floatMask) {
+  printf("DCMD:%d:%s", h, name);
+  for (uint8_t i = 0; i < argc; i++) {
+    if (floatMask & (1u << i)) printf(",%g", asFloat(args[i]));
+    else printf(",%d", args[i]);
+  }
+  printf("\n");
+  return wantFloat ? asBits(2.5f) : 5;
+}
+static const DeviceBridge fake_dev_bridge = { fake_dev_lookup, fake_dev_ready, fake_dev_command };
+
 static std::vector<uint8_t> readFile(const char *path) {
   std::vector<uint8_t> buf;
   FILE *f = fopen(path, "rb");
@@ -89,6 +107,7 @@ int main(int argc, char **argv) {
   vmInit(vm, code.data(), (uint16_t)code.size());
   vmSetPool(vm, pool.data(), (uint16_t)pool.size());
   vmSetCmdBridge(vm, fake_cmd_bridge);
+  vmSetDeviceBridge(vm, &fake_dev_bridge);
   vmRegisterSyscall(vm, sys_print);
   vmRegisterSyscall(vm, sys_printf);
   vmRegisterSyscall(vm, sys_read_power);
@@ -106,6 +125,30 @@ int main(int argc, char **argv) {
 
 
 class StructuralTests(unittest.TestCase):
+    def test_device_builtins_compile_and_disassemble(self):
+        code, pool = gsc.compile_source_with_pool(
+            'q = device("QUAD"); if (ready(q)) { dcmd(q, "SV", 1.5); x = dcmdf(q, "GV"); }')
+        self.assertIn(b"QUAD\x00", pool)
+        text = gsc.disassemble(code, pool)
+        self.assertIn('DEVICE "QUAD"', text)
+        self.assertIn("DREADY", text)
+        self.assertIn('DCMDCALL "SV" argc=1 floatmask=0x0001', text)
+        self.assertIn('DCMDCALLF "GV" argc=0 floatmask=0x0000', text)
+
+    def test_device_handle_must_be_int(self):
+        with self.assertRaises(gsc.CompileError):
+            gsc.compile_source('dcmd(1.5, "SV", 1);')
+        with self.assertRaises(gsc.CompileError):
+            gsc.compile_source('x = ready(2.0);')
+
+    def test_device_opcodes_match_vm_header(self):
+        header = open(os.path.join(SRC_DIR, "GAACEScript.h")).read()
+        body = header[header.index("enum Opcode"):]
+        body = body[:body.index("};")]
+        names = re.findall(r"^\s*(OP_[A-Z0-9_]+)", body, re.M)
+        for n in ("OP_DEVICE", "OP_DREADY", "OP_DCMDCALL", "OP_DCMDCALLF"):
+            self.assertEqual(names.index(n), getattr(gsc, n), n)
+
     def test_arithmetic(self):
         code = gsc.compile_source("syscall print(v) = 0; print(2 + 3 * 4);")
         self.assertIn(gsc.OP_MUL, code)
@@ -286,6 +329,24 @@ class EndToEndVmTests(unittest.TestCase):
         """, reps=3)
         self.assertEqual(status, 1)
         self.assertEqual([int(l) for l in lines], [1, 2, 3])
+
+    def test_device_ready_and_dcmd(self):
+        status, lines = self.run_script("""
+            syscall print(v) = 0;
+            syscall printf(v) = 1;
+            q = device("QUAD");
+            n = device("NOPE");
+            print(q); print(ready(q)); print(ready(n));
+            if (ready(q)) {
+                r = dcmd(q, "SRFADRV", 1, 3.5, true);
+                print(r);
+                x = dcmdf(q, "GRFADRV", 1);
+                printf(x + 1.0);
+            }
+        """)
+        self.assertEqual(status, 1)
+        self.assertEqual(lines, ["7", "1", "0", "DCMD:7:SRFADRV,1,3.5,1", "5",
+                                 "DCMD:7:GRFADRV,1", "F3.5"])
 
     def test_true_false_literals_are_1_and_0(self):
         status, lines = self.run_script("""

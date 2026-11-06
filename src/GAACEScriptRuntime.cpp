@@ -386,6 +386,28 @@ static void cmdScriptStatus(void) {
   cp.println((int)s.lastStatus);
 }
 
+// GSCRIPTVAR,<slot>,<var> — a script variable's value, for debugging:
+// "<as int>,<as float>" (variables carry no type tag, so both readings of
+// the same 32 bits are given; use whichever matches the script's type).
+// <var> is the slot index gsc.py --disasm shows for LOAD/STORE.
+static void cmdScriptVar(void) {
+  commandProcessor &cp = *activeInstance->cp_;
+  if (!cp.checkExpectedArgs(2)) return;
+  int slot, var;
+  if (!cp.getValue(&slot) || slot < 0 || slot >= SCRIPT_SLOTS ||
+      !cp.getValue(&var) || var < 0 || var >= VAR_SLOTS) {
+    cp.sendNAK(ERR_BADARG);
+    return;
+  }
+  int32_t bits = activeInstance->slots[slot].vm.vars[var];
+  float f;
+  memcpy(&f, &bits, sizeof(f));
+  char buf[48];
+  snprintf(buf, sizeof(buf), "%ld,%.7g", (long)bits, (double)f);
+  cp.sendACK(false);
+  cp.println(buf);
+}
+
 static Command scriptCmds[] = {
   {"SCRIPTLOAD",   CMDfunction, -1, (void *)cmdScriptLoad,   NULL,
    "SCRIPTLOAD,<slot>,<hex>[,<hash>] -- load a compiled script into a slot"},
@@ -399,6 +421,8 @@ static Command scriptCmds[] = {
    "slots,maxCodeLen,stackSize,varSlots,maxSyscalls"},
   {"GSCRIPTST",     CMDfunction, 1, (void *)cmdScriptStatus, NULL,
    "GSCRIPTST,<slot> -- loaded(0|1),lastStatus"},
+  {"GSCRIPTVAR",    CMDfunction, 2, (void *)cmdScriptVar, NULL,
+   "GSCRIPTVAR,<slot>,<var> -- variable as <int>,<float> (debugging)"},
   {NULL}
 };
 static CommandList scriptCmdListNode = {scriptCmds, NULL};
@@ -412,6 +436,10 @@ CommandList *ScriptRuntime::scriptCmdList(void) {
 // the header's poll() comment.
 // -----------------------------------------------------------------------
 void ScriptRuntime::setWaitPoll(WaitPollFn fn) { waitPoll_ = fn; }
+
+void ScriptRuntime::setDeviceBridge(const DeviceBridge *bridge) {
+  for (uint8_t i = 0; i < SCRIPT_SLOTS; i++) vmSetDeviceBridge(slots[i].vm, bridge);
+}
 
 void ScriptRuntime::poll(void) {
   if (waitPoll_ == nullptr) return;

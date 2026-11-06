@@ -122,6 +122,7 @@ only genuinely new commands are:
 | `SCRIPTLOAD,<slot>,<hex>[,<hash>]` | Decode `<hex>` (`gsc.py --scriptload --format hex`, i.e. `[codeLen][code][pool]`) and load it into `<slot>`. NAKs on a bad slot, malformed hex, or a payload over the configured size limit — never silently accepts something it can't run. |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` — lets a host discover the compile-time limits below at runtime instead of hardcoding them. |
 | `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` — the one piece of VM-specific state `threadCommands` doesn't know about. |
+| `GSCRIPTVAR,<slot>,<var>` | A script variable, for debugging: `<as int>,<as float>` (variables carry no type, so both readings of the 32 bits are given). `<var>` is the slot number `gsc.py --disasm` shows for `LOAD`/`STORE`. |
 
 `SCRIPTLOAD` and `SCRIPTCOMMIT` take an optional trailing `<hash>` (the
 syscall table hash, below); `gsc.py --upload` supplies it for you.
@@ -237,6 +238,19 @@ restart it. Disabling a slot (`STENA`) keeps it paused until re-enabled;
 reloading a slot abandons the wait. `GSCRIPTST` reports a waiting slot's
 status as `VM_WAITING` (11). Lower level: `vmRequestWait()`/`vmResume()`
 in `GAACEScript.h`.
+
+### Devices
+
+`device("NAME")`, `ready(dev)`, `dcmd(dev, "CMD", ...)` and `dcmdf(...)`
+let a script talk to other instruments by name, pausing at each command
+until its reply arrives (see [tools/README.md](tools/README.md)). The VM
+hands them to a `DeviceBridge` the project registers once, with
+`scripts.setDeviceBridge(&bridge)`, alongside `setWaitPoll()`/`poll()`:
+`lookup(name)` returns a handle, `ready(handle)` says whether that device
+can be reached, and `command(...)` sends the command and normally calls
+`vmRequestWait()`. GAACE_Script itself knows nothing about how devices are
+found or reached; the USBrepeater's bridge is in its `src/USBrepeater.cpp`
+(Section 6e).
 
 ## Layout
 

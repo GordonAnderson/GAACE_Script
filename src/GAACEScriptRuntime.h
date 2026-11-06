@@ -212,6 +212,12 @@ public:
   void setWaitPoll(WaitPollFn fn);
   void poll(void);
 
+  // Device built-ins (device()/ready()/dcmd()/dcmdf(), GAACEScript.h):
+  // installs the project's DeviceBridge on every slot. `bridge` must
+  // outlive this object (use a static const). Without it, a script using
+  // them stops with VM_ERR_NO_DEVICE_BRIDGE.
+  void setDeviceBridge(const DeviceBridge *bridge);
+
   commandProcessor *cp_;  // used by the file-scope command handlers (see .cpp)
 
   // State for GSYSCALLS / the optional <hash> check; set by registerSyscalls().
