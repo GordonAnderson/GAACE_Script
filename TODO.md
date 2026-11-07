@@ -10,7 +10,11 @@ the working list of what's still unresolved.
 - [ ] **License.** Placeholder `MIT` in `library.json`. Existing GAACE
       libraries aren't consistent (`GAACE_Core` is GPLv3, `ArduinoThread`
       is Public Domain) — on hold at the user's request, not forgotten.
-- [ ] **Host-application (Qt) integration.** The user's Qt application
+- [ ] **Host-application (Qt) integration.** Design decided 2026-11-06 —
+      see [MIPS_HOST_APP_INTEGRATION.md](MIPS_HOST_APP_INTEGRATION.md): the
+      app does the device side over its own connection and runs `gsc.py`
+      through `QProcess` (one compiler, no C++ port). Not implemented yet.
+      The original deferral note, kept for history: the user's Qt application
       already talks to hardware and hosts control panels; editing/
       compiling/downloading scripts *inside* it was considered and
       deliberately not pursued yet. The compiler is Python; integrating it
@@ -62,6 +66,15 @@ against different syscalls. Open items:
 
 ## Known, accepted limitations (not bugs — documented behavior)
 
+- [x] ~~`cmd()`/`cmdf()` command names aren't validated~~ — `gsc.py` now
+      warns about names missing from the device's command list (`GCMDS`,
+      which every GAACE_Core device already has): `--upload` asks the device,
+      `--commands FILE` checks offline, `--json` returns `warnings`. Still
+      open: argument counts/types aren't checked (`GCMDS` doesn't report
+      them -- would need `nargs`/type from the `Command` table exposed by
+      GAACE_Core), the list has no terminator so the reader waits 0.4 s of
+      silence, and a runtime "last `cmd()` was NAKed" flag in `GSCRIPTST`
+      doesn't exist.
 - [ ] `cmd()`'s return value can't distinguish NAK from "ACK with value
       0" — both come back as `0`. A script that needs to know for sure
       has to know which commands it's calling and design around it.

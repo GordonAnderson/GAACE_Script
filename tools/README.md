@@ -145,6 +145,37 @@ blobs: the **code**, and a **pool** of NUL-terminated name strings. Each
 command call in the code is `CMDCALL <poolOffset:u16> <argc>` (`CMDCALLF`
 for `cmdf()`), where `poolOffset` is the byte offset of its name in the pool.
 
+**Command names are not declared, and the compiler can only warn.** Unlike
+syscalls, a command used with `cmd()` needs no declaration and no table
+entry: the compiler stores the name string in the pool. Whether `"SDRV"`
+exists is only discovered on the device, when the line is run. An unknown
+command, a typo (`"SDRW"`), or wrong arguments get a NAK from the command
+processor, which `cmd()` turns into a return value of `0`; the script keeps
+running and the VM reports no error (`GSCRIPTST` looks normal). A script
+can't reliably tell that from a command that succeeded with 0.
+
+To catch typos before they reach the device, `gsc.py` can check names against
+the device's **command list**. Every GAACE_Core device already answers
+`GCMDS` (one `NAME,help` line per command; `?` commands appear as both
+`GNAME` and `SNAME`), so no firmware change is needed:
+
+- `--upload` asks the device (`GCMDS`) and warns, e.g.
+  `warning: line 2, column 5: the device has no command 'SDRW'; at run time
+  cmd() would return 0 -- did you mean 'SDRV'?`. It's a **warning, not an
+  error**: the script still compiles and uploads (the list could be out of
+  date, or the device case-insensitive).
+- `--list-commands PORT` prints the list; add `--save-commands FILE` to keep
+  it, and `--commands FILE` to check offline. `--no-device-commands` skips the
+  query during `--upload`.
+- With `--json`, warnings come back in a `"warnings"` array (same shape as an
+  error: `message`, `line`, `column`, ...), so an editor can mark them.
+
+What it does **not** check: argument counts or types (`GCMDS` doesn't report
+them), `dcmd()` names (those run on another instrument), or that the command
+does what you want. `GCMDS` has no terminator, so the list ends when the
+device falls silent for 0.4 s; that adds a short pause to each `--upload`.
+Still **test new scripts against the real device**.
+
 **Float arguments.** `cmd("SETV", 23.76);` sends the text `SETV,23.76` —
 the compiler knows each argument's type, so a float expression is formatted
 as a decimal number (up to 7 significant digits), an int as an integer. A
@@ -266,7 +297,54 @@ python3 gsc.py program.gs --upload /dev/ttyUSB0 --slot 1
                                                         # the connection; --disasm can be
                                                         # combined with --upload to preview
                                                         # what's being sent. See WORKFLOW.md.
+python3 gsc.py program.gs --json --syscalls dev.json
+                                                        # compile only, report as ONE JSON
+                                                        # object (see "Driving gsc.py from
+                                                        # another program" below)
+python3 gsc.py --list-commands /dev/ttyUSB0 --save-commands cmds.json
+                                                        # the device's cmd()-callable commands
+python3 gsc.py program.gs --commands cmds.json ...     # warn about unknown cmd() names offline
+python3 gsc.py --version                               # gsc 1.2.0
 ```
+
+### Compile errors
+
+A compile error is reported with its location:
+
+```
+error: line 2, column 5: call to undeclared syscall 'foo' -- declare it ...
+```
+
+The location points at the offending token or expression (for an operator
+error, at the operator). Exit code is 1.
+
+### Driving gsc.py from another program (`--json`)
+
+`--json` compiles only (it can't be combined with `--upload`/`--list-syscalls`)
+and prints exactly one JSON object on stdout; stderr stays empty. Exit code
+is 0 on success, 1 on error. Add `--syscalls FILE` to compile against a saved
+device table. This is the interface the MIPS host app uses; see
+[../MIPS_HOST_APP_INTEGRATION.md](../MIPS_HOST_APP_INTEGRATION.md).
+
+```
+{"version": "1.2.0", "ok": true,
+ "payload": "0d00190000c03f29...",   // [codeLen][code][pool]: what SCRIPTLOAD / SCRIPTAPPEND carry
+ "code_len": 13, "pool_len": 5,
+ "uses_syscalls": false,
+ "syscall_hash": null,                // 8 hex digits: last arg of SCRIPTLOAD/SCRIPTCOMMIT; null if unused
+ "disasm": "   0: PUSH_F32 1.5\n ...",
+ "warnings": []}                       // same shape as "error"; e.g. an unknown cmd() name
+
+{"version": "1.2.0", "ok": false,
+ "error": {"message": "unexpected token ';' (';')",
+           "line": 2, "column": 5, "offset": 11,   // 1-based line/column; offset is a 0-based character index
+           "source_line": "y = ;"}}                 // line/column/offset/source_line are null if the error has no location
+```
+
+`version` is gsc.py's `__version__`; it changes whenever the command line or
+this output changes in a way a calling program could notice. Errors that
+aren't about the script (an unreadable source or `--syscalls` file) come
+back as `{"ok": false, "error": {"message": "..."}}` with no location.
 
 ## Tests
 

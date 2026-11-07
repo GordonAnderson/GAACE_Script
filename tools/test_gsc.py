@@ -13,6 +13,7 @@ Two layers:
 Run with: python3 -m unittest tools/test_gsc.py -v
 """
 import io
+import json
 import re
 import os
 import shutil
@@ -662,6 +663,90 @@ def _gsyscalls_reply(table, corrupt_hash=False):
     return lines
 
 
+def _gcmds_reply(*entries, ack_with_first=True):
+    """The lines a device sends for GCMDS, one canned read per line, then
+    silence (b"") -- GCMDS has no terminator, the reader stops on a quiet line."""
+    lines = [f"{n},{h}\r\n".encode() for n, h in entries]
+    lines[0] = b"\x06" + lines[0]       # ACK is printed straight before the first entry
+    return lines + [b""]
+
+
+COMMANDS = [("SDRV", "Set drive"), ("GVER", "Firmware version"), ("GECHO", "Echo mode, TRUE or FALSE")]
+
+
+class CommandListTests(unittest.TestCase):
+    def _query(self, responses):
+        port = _FakeSerialPort(responses)
+        port.timeout = 3.0
+        return gsc.query_command_list(port), port
+
+    def test_parses_gcmds_reply(self):
+        (cs, reason), port = self._query(_gcmds_reply(*COMMANDS))
+        self.assertIsNone(reason)
+        self.assertEqual(port.sent, ["GCMDS"])
+        self.assertEqual([n for n, _ in cs.entries], ["SDRV", "GVER", "GECHO"])
+        self.assertEqual(dict(cs.entries)["SDRV"], "Set drive")
+        self.assertEqual(port.timeout, 3.0)   # restored after the idle-timeout read
+
+    def test_help_text_may_contain_commas(self):
+        (cs, _), _ = self._query(_gcmds_reply(("SDRV", "Set drive, volts, 0 to 100")))
+        self.assertEqual(dict(cs.entries)["SDRV"], "Set drive, volts, 0 to 100")
+
+    def test_nak_and_silence_mean_no_list(self):
+        (cs, reason), _ = self._query([b"\x15?\r\n"])
+        self.assertIsNone(cs)
+        self.assertIn("NAK", reason)
+        (cs, reason), _ = self._query([])
+        self.assertIsNone(cs)
+
+    def test_json_round_trip(self):
+        cs = gsc.CommandSet(COMMANDS)
+        again = gsc.CommandSet.from_json(cs.to_json())
+        self.assertEqual(again.entries, cs.entries)
+
+    def test_bad_json_is_an_error(self):
+        with self.assertRaises(gsc.SyscallTableError):
+            gsc.CommandSet.from_json('{"nope": 1}')
+
+    def test_known_command_gives_no_warning(self):
+        c = gsc.compile_script('cmd("SDRV", 23.5); x = cmdf("GVER");', None, gsc.CommandSet(COMMANDS))
+        self.assertEqual(c.warnings, [])
+
+    def test_unknown_command_warns_with_location_and_suggestion(self):
+        c = gsc.compile_script('x = 1;\ncmd("SDRW", 23.5);', None, gsc.CommandSet(COMMANDS))
+        self.assertEqual(len(c.warnings), 1)
+        w = c.warnings[0]
+        self.assertEqual((w.line, w.column), (2, 5))
+        self.assertIn("SDRW", w.message)
+        self.assertIn("did you mean 'SDRV'", w.message)
+
+    def test_case_difference_is_called_out(self):
+        c = gsc.compile_script('cmd("sdrv", 1);', None, gsc.CommandSet(COMMANDS))
+        self.assertIn("case-sensitive", c.warnings[0].message)
+
+    def test_wildly_wrong_name_gets_no_suggestion(self):
+        c = gsc.compile_script('cmd("QQQQQQ");', None, gsc.CommandSet(COMMANDS))
+        self.assertNotIn("did you mean", c.warnings[0].message)
+
+    def test_every_unknown_use_warns(self):
+        c = gsc.compile_script('cmd("NOPE"); cmd("NOPE");', None, gsc.CommandSet(COMMANDS))
+        self.assertEqual(len(c.warnings), 2)
+
+    def test_no_command_list_means_no_check(self):
+        c = gsc.compile_script('cmd("NOPE");')
+        self.assertEqual(c.warnings, [])
+
+    def test_unknown_command_still_compiles_identically(self):
+        with_list = gsc.compile_script('cmd("NOPE", 1);', None, gsc.CommandSet(COMMANDS))
+        without = gsc.compile_script('cmd("NOPE", 1);')
+        self.assertEqual((with_list.code, with_list.pool), (without.code, without.pool))
+
+    def test_dcmd_is_not_checked_against_the_local_list(self):
+        # dcmd() runs on another instrument, so the device's own list says nothing.
+        c = gsc.compile_script('dcmd(device("X"), "ANYTHING");', None, gsc.CommandSet(COMMANDS))
+        self.assertEqual(c.warnings, [])
+
+
 class QuerySyscallTableTests(unittest.TestCase):
     def _query(self, responses):
         port = _FakeSerialPort(responses)
@@ -709,7 +794,9 @@ class UploadWithSyscallTableTests(unittest.TestCase):
 
     TABLE = gsc.SyscallTable(SHARED_VECTOR_TABLE)
 
-    def _main(self, source, responses, extra=()):
+    def _main(self, source, responses, extra=(), device_commands=False):
+        if not device_commands:      # keep these tests about syscalls: no GCMDS exchange
+            extra = (*extra, "--no-device-commands")
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "t.gs")
             with open(path, "w") as f:
@@ -797,6 +884,209 @@ class UploadWithSyscallTableTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("float get_volts(a0)", out.getvalue())
         self.assertIn(f"{SHARED_VECTOR_HASH:08X}", out.getvalue())
+
+
+class ErrorLocationTests(unittest.TestCase):
+    def _error(self, src, table=None):
+        with self.assertRaises(gsc.CompileError) as cm:
+            gsc.compile_script(src, table)
+        return cm.exception
+
+    def test_parse_error_has_line_and_column(self):
+        e = self._error("x = 1;\ny = ;")
+        self.assertEqual((e.line, e.column), (2, 5))
+        self.assertEqual(e.source_line, "y = ;")
+        self.assertIn("unexpected token", e.message)
+        self.assertNotIn("offset", e.message)  # location is structured, not in the text
+
+    def test_lexer_error_has_location(self):
+        e = self._error("x = 5 $ 2;")
+        self.assertEqual((e.line, e.column), (1, 7))
+
+    def test_codegen_error_is_located_at_the_offending_expression(self):
+        e = self._error("x = 1;\ny = foo(1);")
+        self.assertEqual((e.line, e.column), (2, 5))   # the call, not the end of the statement
+
+    def test_operator_error_points_at_the_operator(self):
+        e = self._error("var a: float;\n\na = 2.0 && 1;")
+        self.assertEqual((e.line, e.column), (3, 9))
+
+    def test_duplicate_syscall_declaration_is_located(self):
+        e = self._error("syscall a(x) = 1;\nsyscall a(x) = 2;")
+        self.assertEqual((e.line, e.column), (2, 1))
+
+    def test_parenthesised_expression_keeps_inner_position(self):
+        e = self._error("x = (1 + 2.0) && 3;")
+        self.assertEqual((e.line, e.column), (1, 15))
+
+    def test_crlf_line_endings(self):
+        e = self._error("x = 1;\r\ny = ;")
+        self.assertEqual((e.line, e.column, e.source_line), (2, 5, "y = ;"))
+
+    def test_describe_and_to_dict(self):
+        e = self._error("y = ;")
+        self.assertTrue(e.describe().startswith("line 1, column 5: "))
+        d = e.to_dict()
+        self.assertEqual((d["line"], d["column"], d["offset"]), (1, 5, 4))
+
+    def test_error_without_a_position_describes_as_plain_message(self):
+        e = gsc.CompileError("boom")
+        e.locate("abc")
+        self.assertEqual(e.describe(), "boom")
+        self.assertIsNone(e.to_dict()["line"])
+
+
+class JsonModeTests(unittest.TestCase):
+    """gsc.py --json: the interface the MIPS Qt app uses (one JSON object on
+    stdout, exit code 0/1)."""
+
+    def _run(self, source, *extra):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.gs")
+            with open(path, "w") as f:
+                f.write(source)
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "gsc.py"),
+                                path, "--json", *extra], capture_output=True, text=True)
+        self.assertEqual(r.stderr, "")
+        return r.returncode, json.loads(r.stdout)
+
+    def test_success_reports_payload_and_lengths(self):
+        rc, out = self._run('cmd("SETV", 1.5);')
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        code, pool = gsc.compile_source_with_pool('cmd("SETV", 1.5);')
+        self.assertEqual(out["payload"], gsc.build_scriptload_payload(code, pool).hex())
+        self.assertEqual((out["code_len"], out["pool_len"]), (len(code), len(pool)))
+        self.assertFalse(out["uses_syscalls"])
+        self.assertIsNone(out["syscall_hash"])
+        self.assertEqual(out["version"], gsc.__version__)
+        self.assertIn("CMDCALLM", out["disasm"])
+
+    def test_error_reports_location(self):
+        rc, out = self._run("x = 1;\ny = ;")
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+        self.assertEqual((out["error"]["line"], out["error"]["column"]), (2, 5))
+        self.assertEqual(out["error"]["source_line"], "y = ;")
+
+    def test_syscall_table_stamps_hash_only_when_used(self):
+        with tempfile.TemporaryDirectory() as d:
+            tpath = os.path.join(d, "table.json")
+            with open(tpath, "w") as f:
+                f.write(gsc.SyscallTable(SHARED_VECTOR_TABLE).to_json())
+            rc, out = self._run("set_volts(read_adc());", "--syscalls", tpath)
+            self.assertEqual(rc, 0)
+            self.assertTrue(out["uses_syscalls"])
+            self.assertEqual(out["syscall_hash"], f"{SHARED_VECTOR_HASH:08X}")
+            rc, out = self._run('cmd("GVER");', "--syscalls", tpath)
+            self.assertIsNone(out["syscall_hash"])
+
+    def test_unreadable_syscall_file_is_a_json_error(self):
+        rc, out = self._run("x = 1;", "--syscalls", "/nonexistent/table.json")
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+        self.assertIn("message", out["error"])
+
+    def test_missing_source_file_is_a_json_error(self):
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "gsc.py"),
+                            "/nonexistent/x.gs", "--json"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(json.loads(r.stdout)["ok"])
+
+    def test_json_cannot_combine_with_upload(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            gsc.main(["x.gs", "--json", "--upload", "FAKE", "--slot", "1"])
+
+    def test_text_mode_error_includes_line_and_column(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.gs")
+            with open(path, "w") as f:
+                f.write("x = 1;\ny = ;")
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                status = gsc.main([path])
+        self.assertEqual(status, 1)
+        self.assertIn("error: line 2, column 5: ", err.getvalue())
+
+    def test_version_flag(self):
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "gsc.py"),
+                            "--version"], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), f"gsc {gsc.__version__}")
+
+
+class CommandListCliTests(unittest.TestCase):
+    def _run_json(self, source, *extra):
+        with tempfile.TemporaryDirectory() as d:
+            src, lst = os.path.join(d, "t.gs"), os.path.join(d, "cmds.json")
+            with open(src, "w") as f:
+                f.write(source)
+            with open(lst, "w") as f:
+                f.write(gsc.CommandSet(COMMANDS).to_json())
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "gsc.py"),
+                                src, "--json", "--commands", lst, *extra],
+                               capture_output=True, text=True)
+        return r.returncode, json.loads(r.stdout)
+
+    def test_json_reports_warnings_and_still_succeeds(self):
+        rc, out = self._run_json('cmd("SDRW", 1);')
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertEqual((out["warnings"][0]["line"], out["warnings"][0]["column"]), (1, 5))
+
+    def test_json_has_empty_warnings_when_clean(self):
+        rc, out = self._run_json('cmd("SDRV", 1);')
+        self.assertEqual(out["warnings"], [])
+
+    def test_text_mode_prints_warning_to_stderr_and_exits_0(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, lst = os.path.join(d, "t.gs"), os.path.join(d, "cmds.json")
+            open(src, "w").write('cmd("SDRW", 1);')
+            open(lst, "w").write(gsc.CommandSet(COMMANDS).to_json())
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as err, \
+                 mock.patch("sys.stdout", new_callable=io.StringIO):
+                status = gsc.main([src, "--commands", lst, "--format", "hex", "--scriptload"])
+        self.assertEqual(status, 0)
+        self.assertIn("warning: line 1, column 5: the device has no command 'SDRW'", err.getvalue())
+
+    def test_missing_command_file_is_an_error(self):
+        rc, out = self._run_json("x = 1;", "--commands", "/nonexistent.json")
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+
+
+class UploadWithCommandListTests(unittest.TestCase):
+    """--upload asks GCMDS after GSYSCALLS and warns about unknown cmd() names."""
+
+    TABLE = UploadWithSyscallTableTests.TABLE
+    _main = UploadWithSyscallTableTests._main
+
+    def _upload(self, source, extra=()):
+        responses = (_gsyscalls_reply(self.TABLE) + _gcmds_reply(*COMMANDS) + [b"\x06"])
+        return self._main(source, responses, extra=extra, device_commands=True)
+
+    def test_known_command_uploads_without_warning(self):
+        status, sent, err = self._upload('cmd("SDRV", 23.5);')
+        self.assertEqual(status, 0)
+        self.assertEqual(sent[:2], ["GSYSCALLS", "GCMDS"])
+        self.assertTrue(sent[2].startswith("SCRIPTLOAD,2,"))
+        self.assertNotIn("warning", err)
+
+    def test_unknown_command_warns_but_still_uploads(self):
+        status, sent, err = self._upload('cmd("SDRW", 23.5);')
+        self.assertEqual(status, 0)
+        self.assertTrue(sent[2].startswith("SCRIPTLOAD,2,"))
+        self.assertIn("did you mean 'SDRV'", err)
+
+    def test_device_without_gcmds_just_notes_it(self):
+        responses = _gsyscalls_reply(self.TABLE) + [b"\x15?\r\n", b"\x06"]
+        status, sent, err = self._main('cmd("SDRW");', responses, device_commands=True)
+        self.assertEqual(status, 0)
+        self.assertIn("no command list", err)
+
+    def test_no_device_commands_skips_the_query(self):
+        responses = _gsyscalls_reply(self.TABLE) + [b"\x06"]
+        status, sent, _ = self._main('cmd("SDRW");', responses)
+        self.assertNotIn("GCMDS", sent)
 
 
 if __name__ == "__main__":

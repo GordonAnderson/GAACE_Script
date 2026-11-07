@@ -138,6 +138,7 @@ a running controller's control port via SCRIPTLOAD (see WORKFLOW.md).
 """
 
 import argparse
+import difflib
 import re
 import struct
 import json
@@ -215,8 +216,44 @@ COMPARISON_OPS = {"==", "!=", "<", "<=", ">", ">="}
 LOGIC_OPS = {"&&", "||"}
 
 
+# Bumped when the CLI or its --json output changes in a way a host program
+# (the MIPS Qt app runs this as a subprocess) could notice.
+__version__ = "1.2.0"
+
+
 class CompileError(Exception):
-    pass
+    """A compile error. str(e) is just the message. `pos` is a character
+    offset into the source (None if the error can't be tied to one spot);
+    compile_script() fills in `line`/`column` (1-based) and `source_line`
+    from it, so a host editor can underline the offending spot."""
+
+    def __init__(self, message, pos=None):
+        super().__init__(message)
+        self.message = message
+        self.pos = pos
+        self.line = None
+        self.column = None
+        self.source_line = None
+
+    def locate(self, src):
+        if self.pos is None:
+            return
+        pos = min(max(self.pos, 0), len(src))
+        line_start = src.rfind("\n", 0, pos) + 1
+        line_end = src.find("\n", pos)
+        self.line = src.count("\n", 0, pos) + 1
+        self.column = pos - line_start + 1
+        self.source_line = src[line_start:line_end if line_end != -1 else len(src)].rstrip("\r")
+
+    def describe(self):
+        """One-line human form: 'line 3, column 5: message'."""
+        if self.line is None:
+            return self.message
+        return f"line {self.line}, column {self.column}: {self.message}"
+
+    def to_dict(self):
+        return {"message": self.message, "offset": self.pos, "line": self.line,
+                "column": self.column, "source_line": self.source_line}
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +379,96 @@ def query_syscall_table(ser):
 
 
 # ---------------------------------------------------------------------------
+# Command list (GCMDS): the names cmd() can call on a device
+#
+# Unlike the syscall table this changes nothing about the bytecode -- it only
+# lets the compiler warn about a cmd("NAME", ...) the device doesn't have. Every
+# GAACE_Core device already answers GCMDS (ACK, then one "NAME,help" line per
+# command, with '?' commands listed twice as GNAME/SNAME), so no firmware change
+# is needed.
+# ---------------------------------------------------------------------------
+class CommandSet:
+    """The commands a device offers: an ordered list of (name, help)."""
+
+    def __init__(self, entries):
+        self.entries = [(n, h) for n, h in entries]
+        self.names = {n for n, _ in self.entries}
+
+    def to_json(self):
+        return json.dumps({"commands": [{"name": n, "help": h} for n, h in self.entries]},
+                          indent=2) + "\n"
+
+    @classmethod
+    def from_json(cls, text):
+        try:
+            data = json.loads(text)
+            return cls((e["name"], e.get("help", "")) for e in data["commands"])
+        except (ValueError, KeyError, TypeError) as e:
+            raise SyscallTableError(f"not a valid command list file: {e}")
+
+    @classmethod
+    def from_gcmds_lines(cls, lines):
+        entries = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            name, _, help_ = line.partition(",")
+            entries.append((name.strip(), help_.strip()))
+        return cls(entries)
+
+    def suggest(self, name):
+        """The closest known command name to `name`, or None."""
+        folded = {n.upper(): n for n in self.names}
+        if name.upper() in folded:               # same name, different case
+            return folded[name.upper()]
+        close = difflib.get_close_matches(name.upper(), list(folded), n=1, cutoff=0.7)
+        return folded[close[0]] if close else None
+
+
+def query_command_list(ser, idle_timeout=0.4):
+    """Asks a connected device for its commands (GCMDS). Returns
+    (CommandSet, None), or (None, reason) if the device doesn't answer.
+    GCMDS has no count or terminator, so the list ends when the device has been
+    silent for `idle_timeout` seconds."""
+    ser.reset_input_buffer()
+    ser.write(b"GCMDS\n")
+
+    first = None
+    for _ in range(4):  # tolerate an echoed command line before the ACK
+        line = ser.read_until(b"\n")
+        if not line:
+            return None, "no response"
+        if b"\x15" in line:
+            return None, "the device NAKed GCMDS"
+        if b"\x06" in line:
+            first = line.split(b"\x06", 1)[1]   # ACK is followed directly by the first entry
+            break
+    if first is None:
+        return None, "no ACK in the response"
+
+    lines = [first.decode("ascii", "replace")]
+    old_timeout = getattr(ser, "timeout", None)
+    try:
+        if old_timeout is not None:
+            ser.timeout = idle_timeout
+        while True:
+            line = ser.read_until(b"\n")
+            if not line:
+                break
+            lines.append(line.decode("ascii", "replace"))
+    finally:
+        if old_timeout is not None:
+            ser.timeout = old_timeout
+    return CommandSet.from_gcmds_lines(lines), None
+
+
+def load_command_list_file(path):
+    with open(path) as f:
+        return CommandSet.from_json(f.read())
+
+
+# ---------------------------------------------------------------------------
 # Lexer
 # ---------------------------------------------------------------------------
 WHITESPACE_RE = re.compile(r"\s+")
@@ -385,7 +512,7 @@ def tokenize(src):
             continue
         m = TOKEN_RE.match(src, pos)
         if not m:
-            raise CompileError(f"unexpected character {src[pos]!r} at offset {pos}")
+            raise CompileError(f"unexpected character {src[pos]!r}", pos)
         pos = m.end()
         kind = m.lastgroup
         text = m.group(kind)
@@ -459,6 +586,29 @@ class VarDecl:
     def __init__(self, name, var_type="int"): self.name, self.var_type = name, var_type
 
 
+def _at(node, pos):
+    """Records the source offset a node started at (first writer wins, so a
+    parenthesised expression keeps its inner node's own position)."""
+    if not hasattr(node, "pos"):
+        node.pos = pos
+    return node
+
+
+def _locating(fn):
+    """Codegen wrapper: an error raised without a position gets the position
+    of the innermost AST node being generated when it was raised."""
+    def wrapper(self, node, *args, **kwargs):
+        try:
+            return fn(self, node, *args, **kwargs)
+        except CompileError as e:
+            if e.pos is None:
+                e.pos = getattr(node, "pos", None)
+            raise
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # Parser (recursive descent)
 # ---------------------------------------------------------------------------
@@ -481,7 +631,7 @@ class Parser:
     def expect(self, kind):
         t = self.peek()
         if t.kind != kind:
-            raise CompileError(f"expected {kind!r} but found {t.kind!r} ({t.value!r}) at offset {t.pos}")
+            raise CompileError(f"expected {kind!r} but found {t.kind!r} ({t.value!r})", t.pos)
         return self.advance()
 
     def parse_program(self):
@@ -498,9 +648,10 @@ class Parser:
         if self.at("int") or self.at("float"):
             return self.advance().kind
         t = self.peek()
-        raise CompileError(f"expected a type ('int' or 'float') but found {t.kind!r} at offset {t.pos}")
+        raise CompileError(f"expected a type ('int' or 'float') but found {t.kind!r}", t.pos)
 
     def parse_syscall_decl(self):
+        start = self.peek().pos
         self.expect("syscall")
         name = self.expect("IDENT").value
         self.expect("(")
@@ -518,7 +669,7 @@ class Parser:
         self.expect("=")
         id_tok = self.expect("NUMBER")
         self.expect(";")
-        return SyscallDecl(name, params, int(id_tok.value, 0), return_type)
+        return _at(SyscallDecl(name, params, int(id_tok.value, 0), return_type), start)
 
     def parse_block(self):
         self.expect("{")
@@ -529,6 +680,10 @@ class Parser:
         return Block(stmts)
 
     def parse_statement(self):
+        start = self.peek().pos
+        return _at(self._parse_statement(), start)
+
+    def _parse_statement(self):
         if self.at("{"):
             return self.parse_block()
         if self.at("if"):
@@ -580,39 +735,43 @@ class Parser:
     def parse_or(self):
         left = self.parse_and()
         while self.at("||"):
-            self.advance()
-            left = BinOp("||", left, self.parse_and())
+            tok = self.advance()
+            left = _at(BinOp("||", left, self.parse_and()), tok.pos)
         return left
 
     def parse_and(self):
         left = self.parse_cmp()
         while self.at("&&"):
-            self.advance()
-            left = BinOp("&&", left, self.parse_cmp())
+            tok = self.advance()
+            left = _at(BinOp("&&", left, self.parse_cmp()), tok.pos)
         return left
 
     def parse_cmp(self):
         left = self.parse_add()
         while self.peek().kind in ("==", "!=", "<", "<=", ">", ">="):
-            op = self.advance().kind
-            left = BinOp(op, left, self.parse_add())
+            tok = self.advance()
+            left = _at(BinOp(tok.kind, left, self.parse_add()), tok.pos)
         return left
 
     def parse_add(self):
         left = self.parse_mul()
         while self.peek().kind in ("+", "-"):
-            op = self.advance().kind
-            left = BinOp(op, left, self.parse_mul())
+            tok = self.advance()
+            left = _at(BinOp(tok.kind, left, self.parse_mul()), tok.pos)
         return left
 
     def parse_mul(self):
         left = self.parse_unary()
         while self.peek().kind in ("*", "/", "%"):
-            op = self.advance().kind
-            left = BinOp(op, left, self.parse_unary())
+            tok = self.advance()
+            left = _at(BinOp(tok.kind, left, self.parse_unary()), tok.pos)
         return left
 
     def parse_unary(self):
+        start = self.peek().pos
+        return _at(self._parse_unary(), start)
+
+    def _parse_unary(self):
         if self.peek().kind in ("-", "!"):
             op = self.advance().kind
             return UnOp(op, self.parse_unary())
@@ -625,6 +784,10 @@ class Parser:
         return self.parse_primary()
 
     def parse_primary(self):
+        start = self.peek().pos
+        return _at(self._parse_primary(), start)
+
+    def _parse_primary(self):
         t = self.peek()
         if t.kind == "NUMBER":
             self.advance()
@@ -659,7 +822,9 @@ class Parser:
                 self.advance()
                 args.append(self.parse_expr())
             self.expect(")")
-            return CmdCall(name_tok.value, args, is_float=(t.kind == "cmdf"))
+            node = CmdCall(name_tok.value, args, is_float=(t.kind == "cmdf"))
+            node.name_pos = name_tok.pos   # where the "NAME" string is, for warnings
+            return node
         if t.kind == "device":
             self.advance()
             self.expect("(")
@@ -689,7 +854,7 @@ class Parser:
             e = self.parse_expr()
             self.expect(")")
             return e
-        raise CompileError(f"unexpected token {t.kind!r} ({t.value!r}) at offset {t.pos}")
+        raise CompileError(f"unexpected token {t.kind!r} ({t.value!r})", t.pos)
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +865,7 @@ class Codegen:
         self.syscalls = syscalls  # name -> (id, argc, return_type)
         self.from_table = from_table  # syscalls came from a device/file table
         self.used_syscalls = set()    # names actually called by the script
+        self.cmd_uses = []            # (name, source offset) for every cmd()/cmdf()
         self.buf = bytearray()
         self.vars = {}            # name -> slot
         self.var_types = {}       # name -> "int" | "float"
@@ -828,6 +994,7 @@ class Codegen:
         for stmt in block.stmts:
             self.gen_stmt(stmt)
 
+    @_locating
     def gen_stmt(self, stmt):
         if isinstance(stmt, Block):
             self.gen_block(stmt)
@@ -875,6 +1042,7 @@ class Codegen:
         else:
             raise CompileError(f"internal error: unknown statement {stmt!r}")
 
+    @_locating
     def gen_expr(self, expr):
         """Emits code to evaluate `expr`, leaving one value on the stack.
         Returns the type ("int" or "float") of that value."""
@@ -957,6 +1125,7 @@ class Codegen:
             return return_type
 
         if isinstance(expr, CmdCall):
+            self.cmd_uses.append((expr.cmd_name, getattr(expr, "name_pos", getattr(expr, "pos", None))))
             offset = self.pool_offset_for(expr.cmd_name)
             if offset > 0xFFFF:
                 raise CompileError("string pool too large (over 65535 bytes)")
@@ -1018,17 +1187,56 @@ class CompiledScript:
     the script calls any syscalls (if it doesn't, the syscall-table hash is
     irrelevant to it and isn't stamped on upload)."""
 
-    def __init__(self, code, pool, uses_syscalls):
+    def __init__(self, code, pool, uses_syscalls, cmd_uses=(), warnings=()):
         self.code, self.pool, self.uses_syscalls = code, pool, uses_syscalls
+        self.cmd_uses = list(cmd_uses)   # (name, source offset) per cmd()/cmdf() call
+        # CompileError objects used as non-fatal diagnostics (located like errors).
+        self.warnings = list(warnings)
 
 
-def compile_script(src, syscall_table=None):
-    """Compiles `src`. With a `syscall_table` (a SyscallTable from the device
+def compile_script(src, syscall_table=None, commands=None):
+    """Compiles `src`; a CompileError that escapes has line/column filled in.
+
+    With a `syscall_table` (a SyscallTable from the device
     or a saved file), every syscall in it is callable without a declaration,
     and any explicit `syscall NAME(...) = ID;` declaration must agree with it
     -- a disagreement (wrong id, argument count, return type, or a name the
     table doesn't have) is a compile error rather than a script that
     silently calls the wrong function."""
+    try:
+        compiled = _compile_script(src, syscall_table)
+    except CompileError as e:
+        e.locate(src)
+        raise
+    if commands is not None:
+        compiled.warnings = check_commands(src, compiled.cmd_uses, commands)
+    return compiled
+
+
+def check_commands(src, cmd_uses, commands):
+    """Warnings (located CompileError objects) for every cmd()/cmdf() whose
+    command name the device's command list doesn't contain. Not errors: the
+    device may be case-insensitive, or the list may be out of date. The call
+    still compiles and, on the device, a NAK just reads as 0."""
+    warnings = []
+    for name, pos in cmd_uses:
+        if name in commands.names:
+            continue
+        near = commands.suggest(name)
+        if near is not None and near.upper() == name.upper():
+            hint = f" -- the device has '{near}' (names are case-sensitive unless CASE is FALSE)"
+        elif near is not None:
+            hint = f" -- did you mean '{near}'?"
+        else:
+            hint = ""
+        w = CompileError(f"the device has no command '{name}'; at run time cmd() would "
+                         f"return 0{hint}", pos)
+        w.locate(src)
+        warnings.append(w)
+    return warnings
+
+
+def _compile_script(src, syscall_table):
     tokens = tokenize(src)
     decls, program = Parser(tokens).parse_program()
 
@@ -1036,7 +1244,8 @@ def compile_script(src, syscall_table=None):
     declared = set()
     for d in decls:
         if d.name in declared:
-            raise CompileError(f"syscall '{d.name}' declared more than once")
+            raise CompileError(f"syscall '{d.name}' declared more than once",
+                               getattr(d, "pos", None))
         declared.add(d.name)
         decl = (d.id, len(d.params), d.return_type)
         if syscall_table:
@@ -1044,18 +1253,20 @@ def compile_script(src, syscall_table=None):
             if actual is None:
                 raise CompileError(
                     f"syscall '{d.name}' is declared but the device has no such syscall "
-                    f"(it offers: {', '.join(sorted(syscalls)) or '(none)'})")
+                    f"(it offers: {', '.join(sorted(syscalls)) or '(none)'})",
+                    getattr(d, "pos", None))
             if decl != actual:
                 raise CompileError(
                     f"syscall '{d.name}' is declared as id {decl[0]}, {decl[1]} arg(s), "
                     f"returns {decl[2]}, but the device has id {actual[0]}, {actual[1]} "
                     f"arg(s), returns {actual[2]} -- delete the declaration to use the "
-                    f"device's own")
+                    f"device's own", getattr(d, "pos", None))
         else:
             syscalls[d.name] = decl
     codegen = Codegen(syscalls, from_table=bool(syscall_table))
     code = codegen.gen_program(program)
-    return CompiledScript(code, bytes(codegen.pool), bool(codegen.used_syscalls))
+    return CompiledScript(code, bytes(codegen.pool), bool(codegen.used_syscalls),
+                          codegen.cmd_uses)
 
 
 def compile_source_with_pool(src, syscall_table=None):
@@ -1205,14 +1416,47 @@ def main(argv=None):
     ap.add_argument("--no-device-syscalls", action="store_true",
                      help="with --upload: don't ask the device for its syscall table; the "
                           "script must declare every syscall it uses, as in older versions")
+    ap.add_argument("--commands", metavar="FILE",
+                     help="warn about cmd()/cmdf() names missing from this saved command "
+                          "list (JSON, from --save-commands). With --upload the list is "
+                          "asked of the device (GCMDS) instead, unless this is given.")
+    ap.add_argument("--list-commands", metavar="PORT",
+                     help="ask the controller on PORT for its commands (GCMDS), print them, "
+                          "and exit. Add --save-commands to keep the list.")
+    ap.add_argument("--save-commands", metavar="FILE",
+                     help="with --upload or --list-commands: write the command list the "
+                          "device reported to FILE (JSON) for later use with --commands")
+    ap.add_argument("--no-device-commands", action="store_true",
+                     help="with --upload: don't ask the device for its command list "
+                          "(no unknown-command warnings)")
+    ap.add_argument("--json", action="store_true",
+                     help="compile only, and print one JSON object on stdout instead of "
+                          "text: {\"ok\": true, \"payload\": <SCRIPTLOAD hex>, ...} or "
+                          "{\"ok\": false, \"error\": {\"message\", \"line\", \"column\", "
+                          "...}}. Exit code is 0 on success, 1 on error. For programs that "
+                          "drive gsc.py (see MIPS_HOST_APP_INTEGRATION.md).")
+    ap.add_argument("--version", action="version", version=f"gsc {__version__}")
     args = ap.parse_args(argv)
+    if args.json and (args.upload or args.list_syscalls or args.list_commands):
+        ap.error("--json compiles only; it can't be combined with --upload, "
+                 "--list-syscalls or --list-commands")
 
     if args.list_syscalls:
         return list_syscalls(args)
+    if args.list_commands:
+        return list_commands(args)
     if args.source is None:
         ap.error("a source file is required (or use --list-syscalls PORT)")
 
-    src = sys.stdin.read() if args.source == "-" else open(args.source).read()
+    try:
+        src = sys.stdin.read() if args.source == "-" else open(args.source).read()
+    except OSError as e:
+        if args.json:
+            return _print_json({"ok": False, "error": {"message": f"cannot read {args.source}: {e}"}})
+        raise
+
+    if args.json:
+        return compile_json(args, src)
 
     if args.upload:
         return compile_and_upload(args, src)
@@ -1225,11 +1469,20 @@ def main(argv=None):
             print(f"error: {e}", file=sys.stderr)
             return 1
 
+    commands = None
+    if args.commands:
+        try:
+            commands = load_command_list_file(args.commands)
+        except (OSError, SyscallTableError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+
     try:
-        compiled = compile_script(src, table)
+        compiled = compile_script(src, table, commands)
     except CompileError as e:
-        print(f"error: {e}", file=sys.stderr)
+        print(f"error: {e.describe()}", file=sys.stderr)
         return 1
+    _print_warnings(compiled)
     code, pool = compiled.code, compiled.pool
 
     if args.disasm:
@@ -1258,6 +1511,48 @@ def main(argv=None):
         _emit(code, args, name_suffix="")
 
     return 0
+
+
+def _print_json(obj):
+    """Prints `obj` as the one JSON line --json emits; exit code 0 if it
+    reports success, 1 otherwise."""
+    obj = {"version": __version__, **obj}
+    print(json.dumps(obj))
+    return 0 if obj.get("ok") else 1
+
+
+def compile_json(args, src):
+    """--json: compile `src` (against --syscalls FILE if given) and report the
+    outcome as JSON instead of text. Nothing else goes to stdout."""
+    table = None
+    if args.syscalls:
+        try:
+            table = load_syscall_table_file(args.syscalls)
+        except (OSError, SyscallTableError) as e:
+            return _print_json({"ok": False, "error": {"message": str(e)}})
+    commands = None
+    if args.commands:
+        try:
+            commands = load_command_list_file(args.commands)
+        except (OSError, SyscallTableError) as e:
+            return _print_json({"ok": False, "error": {"message": str(e)}})
+    try:
+        compiled = compile_script(src, table, commands)
+    except CompileError as e:
+        return _print_json({"ok": False, "error": e.to_dict()})
+    payload = build_scriptload_payload(compiled.code, compiled.pool)
+    # Same rule as --upload: only a script that calls syscalls is stamped.
+    stamp = table.hash if (table is not None and compiled.uses_syscalls) else None
+    return _print_json({
+        "ok": True,
+        "payload": payload.hex(),            # exactly what SCRIPTLOAD/SCRIPTAPPEND carry
+        "code_len": len(compiled.code),
+        "pool_len": len(compiled.pool),
+        "uses_syscalls": compiled.uses_syscalls,
+        "syscall_hash": f"{stamp:08X}" if stamp else None,  # last arg of SCRIPTLOAD/COMMIT
+        "disasm": disassemble(compiled.code, compiled.pool),
+        "warnings": [w.to_dict() for w in compiled.warnings],  # e.g. unknown cmd() names
+    })
 
 
 def upload_script(port, slot, payload_hex, baud=115200, timeout=3.0, chunk_bytes=200,
@@ -1388,6 +1683,31 @@ def _device_table(ser, args):
     return table
 
 
+def _print_warnings(compiled):
+    for w in compiled.warnings:
+        print(f"warning: {w.describe()}", file=sys.stderr)
+
+
+def _device_commands(ser, args):
+    """The command list to check cmd() names against for an --upload: from
+    --commands FILE, else asked of the device (GCMDS), else None (no check)."""
+    if args.commands:
+        return load_command_list_file(args.commands)
+    if args.no_device_commands:
+        return None
+    commands, reason = query_command_list(ser)
+    if commands is None:
+        print(f"note: no command list from the device ({reason}); cmd() names are not "
+              f"checked", file=sys.stderr)
+        return None
+    print(f"command list from device: {len(commands.entries)} commands")
+    if args.save_commands:
+        with open(args.save_commands, "w") as f:
+            f.write(commands.to_json())
+        print(f"saved to {args.save_commands}")
+    return commands
+
+
 def compile_and_upload(args, src):
     """--upload: connect, learn the device's syscall table, compile against it,
     and send the result stamped with the table's hash."""
@@ -1406,10 +1726,17 @@ def compile_and_upload(args, src):
             return 1
 
         try:
-            compiled = compile_script(src, table)
-        except CompileError as e:
+            commands = _device_commands(ser, args)
+        except (OSError, SyscallTableError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
+
+        try:
+            compiled = compile_script(src, table, commands)
+        except CompileError as e:
+            print(f"error: {e.describe()}", file=sys.stderr)
+            return 1
+        _print_warnings(compiled)
         if args.disasm:
             print(disassemble(compiled.code, compiled.pool))
 
@@ -1445,6 +1772,27 @@ def list_syscalls(args):
         with open(args.save_syscalls, "w") as f:
             f.write(table.to_json())
         print(f"saved to {args.save_syscalls}")
+    return 0
+
+
+def list_commands(args):
+    """--list-commands PORT: print the device's command list."""
+    ser = _open_port(args.list_commands, args.baud, args.timeout)
+    if ser is None:
+        return 1
+    with ser:
+        time.sleep(0.2)
+        commands, reason = query_command_list(ser)
+    if commands is None:
+        print(f"error: the device gave no command list ({reason})", file=sys.stderr)
+        return 1
+    print(f"{len(commands.entries)} commands")
+    for name, help_ in commands.entries:
+        print(f"  {name}: {help_}")
+    if args.save_commands:
+        with open(args.save_commands, "w") as f:
+            f.write(commands.to_json())
+        print(f"saved to {args.save_commands}")
     return 0
 
 
