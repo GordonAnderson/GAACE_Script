@@ -88,19 +88,35 @@ generator, hash) is not rewritten.
 
 ## Shipping Python with the app
 
-End users should not need a Python install. Options, in order of preference:
+**Decision (2026-11-06): bundle Python's own runtime and ship `gsc.py` as a
+plain text file; the app runs `python gsc.py --json ...` with `QProcess`.**
+Frozen executables (PyInstaller, Nuitka and similar) are ruled out: their
+generic launchers are commonly flagged as malware by antivirus products,
+which has already been a problem for this project.
 
-1. **A frozen `gsc` executable** built with PyInstaller (or similar) and
-   bundled next to the app the way `bossac` is. Built per platform
-   (Windows, macOS, Linux). Compile-only needs no third-party packages, so
-   the frozen binary is small.
-2. **A bundled Python runtime** plus `gsc.py`. Heavier; only if freezing
-   causes trouble.
-3. **System Python**, found at runtime. Simplest for development, but
-   reintroduces the dependency, so use it only for developer builds.
-
-Whichever is used, the app should record the `gsc` version it ships with and
-log it, so a bug report says which compiler produced a given payload.
+- **Windows:** python.org's *embeddable package* (about 10 MB), which is the
+  real interpreter and is signed by the Python Software Foundation.
+- **macOS / Linux:** a standalone Python build placed inside the app bundle /
+  install folder. On macOS the interpreter (and any library inside the
+  bundle) must be code-signed with the app's identity and covered by
+  notarization, as for any bundled executable.
+- **`gsc.py` itself** sits next to it as source. Updating the compiler means
+  replacing that one text file; nothing is built per platform.
+- **The app finds the interpreter** by looking for the bundled one first. A
+  developer build may fall back to a system `python3` on the path, and should
+  say clearly in the UI if neither is found.
+- **Version:** the compile path uses only the standard library (pyserial is
+  imported lazily, for `--upload`/`--list-*` only, which the app doesn't use).
+  The full test suite passes on Python 3.9.7 and 3.12.5; a grep found no
+  syntax newer than that, but 3.8 and older are untested. Bundle a currently
+  supported release (3.12 was the one tested), not 3.9, which is end-of-life.
+- **Log the versions:** the app should record the `gsc` version
+  (`gsc.py --version`) and the interpreter version it uses, so a bug report
+  says which compiler produced a given payload.
+- **Fallback if this proves troublesome:** a C++ port of the compiler. It
+  removes Python and all packaging concerns, but at the cost of two
+  implementations of the bytecode format to keep in step (see the original
+  analysis above); revisit only if bundling is a real problem.
 
 ## `gsc.py` support for being driven by the app
 
@@ -122,7 +138,7 @@ Done (2026-11-06, `gsc.py` 1.2.0; documented in `tools/README.md`):
   JSON (`{"commands": [{"name","help"}]}`), and pass it with `--commands`;
   the names and help strings also suit editor auto-completion.
 - The compile path is stdlib-only (pyserial is imported lazily for
-  `--upload`/`--list-syscalls` only), so the frozen build stays small.
+  `--upload`/`--list-*` only), so the bundled runtime needs no extra packages.
 
 ## Compiling needs a connected device
 
@@ -199,7 +215,8 @@ as a deliverable.
 
 ## Trade-offs accepted
 
-- **A process launch per compile** and a bundled binary to ship and update.
+- **A process launch per compile** and a bundled interpreter to ship, sign and
+  update.
   Compiles are small and infrequent, so speed doesn't matter.
 - **The app depends on `gsc.py`'s command line and output format.** Treat
   those as a contract: the existing `tools/test_gsc.py` tests, plus one test
@@ -235,7 +252,8 @@ as a deliverable.
    a precompiled payload; slot status display. This alone fixes the port-conflict problem.
 4. Qt app: run `gsc.py` through `QProcess`; a plain-text editor with error
    reporting.
-5. Bundle a frozen `gsc` with the app builds.
+5. Bundle the Python runtime and `gsc.py` with the app builds (signing the
+   interpreter on macOS).
 6. Anything more (visual builder, richer editor) once real use shows what is
    needed.
 
