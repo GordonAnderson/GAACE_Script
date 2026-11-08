@@ -94,12 +94,14 @@ Frozen executables (PyInstaller, Nuitka and similar) are ruled out: their
 generic launchers are commonly flagged as malware by antivirus products,
 which has already been a problem for this project.
 
-- **Windows:** python.org's *embeddable package* (about 10 MB), which is the
-  real interpreter and is signed by the Python Software Foundation.
-- **macOS / Linux:** a standalone Python build placed inside the app bundle /
-  install folder. On macOS the interpreter (and any library inside the
-  bundle) must be code-signed with the app's identity and covered by
-  notarization, as for any bundled executable.
+- **Windows:** python.org's *embeddable package* (about 12 MB zip), which is the
+  real interpreter and is signed by the Python Software Foundation, in a
+  `python` folder beside `MIPS.exe`.
+- **macOS:** a python-build-standalone build (arm64) in
+  `MIPS.app/Contents/Resources/python`. It has to be in `Resources`: `codesign
+  --deep` rejects it in `Contents/MacOS` or `Contents/Frameworks`. Every
+  Mach-O file in it is signed explicitly (`tools/python/sign_macos_python.sh`)
+  before the app is signed, and notarization covers it like any bundled code.
 - **`gsc.py` itself** sits next to it as source. Updating the compiler means
   replacing that one text file; nothing is built per platform.
 - **The app finds the interpreter** by looking for the bundled one first. A
@@ -213,6 +215,159 @@ as a deliverable.
   That is enough for a small-script editor; reporting several would be a
   later parser change.
 
+## Qt app implementation plan
+
+Based on a read-only review of `MIPSapp/MIPS_QT6` (branch `dev`, 2026-11-07).
+Scope decisions: **serial-connected systems only** (the `MIPS::Systems` list;
+Ethernet devices found by `GAACEDiscovery` live in `ControlPanel` and are out
+of scope), **the user picks where `.gs` files live** (file dialogs, no managed
+folder), **macOS and Windows only** (Linux builds are not a concern).
+
+### What the existing app code means for the design
+
+- **Two build files.** `MIPS.pro` (qmake) is the real build; `CMakeLists.txt`
+  mirrors its file list. Every new file is added to both.
+- **Bundling precedent.** `tools/bossac` is copied into the macOS bundle /
+  Windows release folder by `copyBossac` rules in `MIPS.pro`, and `program.cpp`
+  runs it with `QProcess`. The Python runtime and `gsc.py` follow the same
+  pattern.
+- **`Comms` cannot yet do what scripting needs.** `SendMessage()` returns one
+  line and treats an ACK-only reply as "no reply" (waits, then retries);
+  `SendCommand()` returns `true` on a timeout; neither handles multi-line
+  replies (`GSYSCALLS`, `GCMDS`); and the 10,000-character `RingBuffer` drops
+  characters when full, so a long `GCMDS` list must be drained as it arrives.
+- **Blocking, GUI thread.** `Comms` busy-waits on the GUI thread. An upload of
+  a few KB freezes the window for a second or two, which is acceptable.
+  Because every chunk is a self-contained, offset-addressed command, the
+  event loop may run between chunks (progress bar) without harm.
+- **`Systems` is rebuilt, and old `Comms` objects are deleted**
+  (`FindAllMIPSsystems`, `MIPSconnect`). The scripting dialog must hold a
+  system's *name* and resolve it with `FindCommPort` on every operation, never
+  keep a `Comms*`.
+- **Naming.** Tools -> Scripting is the existing PC-side JavaScript console.
+  The new item is "Device Scripts".
+
+### Pieces
+
+1. **`Comms::Transact(message, &lines, timeoutMs, idleMs)`** (small addition to
+   `comms.h/.cpp`): returns Ack, Nak or Timeout, collects reply lines, and with
+   `idleMs` keeps reading until the device is quiet (for `GSYSCALLS`/`GCMDS`),
+   emptying the ring buffer as it goes. Reuses the `serialBusy` guard.
+2. **`devicescriptproto.{h,cpp}`**: pure protocol helpers with no `Comms` or
+   widgets, so they can be unit-tested away from hardware: parse `GSYSCALLS`,
+   `GCMDS`, `GSCRIPTLIMITS`, `GSCRIPTST`; the FNV-1a table hash (pinned to
+   the same test vector as the firmware and `gsc.py`); the JSON files
+   `gsc.py --syscalls/--commands` read; and the upload command sequence
+   (single `SCRIPTLOAD`, or `SCRIPTAPPEND` chunks + `SCRIPTCOMMIT`, hash as the
+   last argument) as a pure function mirroring `gsc.py`'s `_upload_on`.
+3. **`DeviceScriptClient`**: runs those sequences over a `Comms`: query tables,
+   upload with retry-once on a timeout (safe: chunks are offset-addressed),
+   slot status, start/stop via the `threadCommands` threads. A NAK on
+   `GSCRIPTLIMITS` means "no scripting on this device".
+4. **`GscRunner`** (phase 2): finds the bundled Python and `gsc.py`, runs
+   `python gsc.py - --json --syscalls T --commands C` with the source on stdin,
+   parses the JSON.
+5. **`DeviceScriptDialog`**: a modeless dialog modelled on `ScriptingConsole`,
+   opened from a new Tools menu action. Phase 1: system and slot pickers,
+   device limits and syscall list, "send a precompiled `.hex`" with an optional
+   table hash, slot status, a log. Phase 2 adds the editor, Check/Send, the
+   error and warning list (click to jump to the line).
+6. **Small edits to existing files:** `mips.ui`/`mips.cpp` (action, member,
+   slot), `properties.*` (remember the last `.gs`/`.hex` folder: two lines in
+   `Save`/`Load`, one field), the About dialog (show the `gsc` version),
+   `Revision.md`, `MIPS.pro` and `CMakeLists.txt` (file lists).
+7. **Packaging** (phase 3): runtime + `gsc.py` under `tools/`, copy rules next
+   to `copyBossac` for macOS and Windows. `macdeployqt` does not sign the
+   Python interpreter, so sign it explicitly with the hardened runtime before
+   notarization. Keep `gsc.py` in the app repo with its version recorded (like
+   `bossac`) and have the app check `--version` at startup. Include Python's
+   license text.
+
+### Phases
+
+| Phase | Work | Rough effort |
+| --- | --- | --- |
+| 1 | `Comms::Transact`, protocol helpers + tests, `DeviceScriptClient`, minimal dialog that uploads a precompiled `.hex` | 3-5 days |
+| 2 | `GscRunner`, editor, error/warning list, Check/Send | 3-4 days |
+| 3 | Bundle the runtime for macOS and Windows, signing, version display | 2-4 days |
+| 4 | Remember which source went to which slot, offer recompile after a firmware change, status and start/stop polish | 2-3 days |
+
+Phase 1 should not be trusted until the firmware handlers have run on real
+hardware (see `TODO.md`).
+
+### Phase 1 status
+
+Built 2026-11-07 on the `dev` branch of `MIPS_QT6` (uncommitted there; see
+that repo's `Revision.md`): `Comms::Transact()`, `devicescriptproto.*` (24
+unit tests in `tests/devicescriptproto_test`),
+`devicescript.*` (the client), `devicescriptdialog.*` and the Tools -> Device
+Scripts menu item. The whole app builds with Qt 6.7.1 (qmake). A throwaway
+integration test drove `Comms::Transact()`, the client and the dialog against a
+fake device on a loopback TCP socket: limits, syscall table, a 501-line
+`GCMDS` reply (about 33 KB, in one burst), NAK, timeout, single and chunked
+uploads with the hash, a hash rejection, and sending from the dialog. That test
+caught a real bug (`waitForReadyRead()` triggers `readData2RingBuffer()`,
+which would have taken the reply before `Transact()` saw it).
+
+### Phase 2 status
+
+Built 2026-11-07 (also uncommitted, on `dev`): `GscRunner` (`gscrunner.*`, runs
+`gsc.py --json` with the device's tables as temporary files, checks the
+`gsc.py` version, handles a missing Python, bad output, a hung compiler and
+non-ASCII source), `CodeEditor` (`codeeditor.*`: line numbers and a
+highlighted problem line), and the reworked Device Scripts dialog: source
+editor, New/Open/Save/Save As (the user picks the location; unsaved changes are
+asked about on close), Check, Send, a clickable error and warning list, and the
+phase 1 hex sending kept under "Send a precompiled .hex file instead". Sending
+a script stamps it with the table hash only if it uses syscalls (the compiler
+decides). The syscall table and command list are read when a system is
+selected and kept in memory only, per the decision above. The app's copy of
+`gsc.py` lives in `tools/gsc/` (a copy of this repo's `tools/gsc.py`) and is
+copied next to the executable by `MIPS.pro`; development builds also find it
+in the source tree, and `GSC_PATH` overrides it.
+
+Tested: 31 unit tests (including `gsc.py`'s real `--json` output), and the
+throwaway loopback test now also drives the dialog end to end with the real
+`gsc.py` against the fake device: a warning for an unknown command, a script
+using a syscall sent with the hash, a located syntax error that blocks the send
+and puts the cursor on the right line, an unknown syscall, an oversize script,
+and the failure messages for an old or broken compiler. Until Python is bundled
+(phase 3) the app needs a system `python3`.
+
+### Phase 3 status
+
+Built 2026-11-07 (also uncommitted, on `dev`): the bundled runtime. Python
+3.14.10 on both platforms, pinned with checksums in `tools/python/versions.txt`;
+`fetch_python.sh` / `fetch_python.ps1` download, verify and prune it (not
+committed: about 47 MB on macOS); `MIPS.pro` copies it and `gsc.py` into the
+build; the release, pre-release and build workflows fetch it, the Windows deploy
+step copies it, and the macOS workflows sign it (`sign_macos_python.sh`, before
+the app is signed; the Developer ID workflow `MACsigning.yml` too). The app finds
+the bundled runtime first and runs it with `-I -B` (isolated; never writes
+`.pyc` files, which would change the signed bundle). About shows
+"Device Scripts compiler: gsc 1.2.0, Python 3.14.10". Full details in the app
+repo's `tools/python/README.md`.
+
+Tested on macOS (arm64): `gsc.py`'s own 115 tests pass under the bundled
+Python 3.14.10; the runtime survives a build into `MIPS.app`, signs (ad hoc,
+hardened runtime) with `codesign --deep` and verifies with `--strict`; the signed
+bundle runs the whole loopback test (dialog, real compiler, fake device) using
+only the bundled Python and `gsc.py`, and still verifies afterwards. One real
+finding: the runtime must live in `Contents/Resources`, because `codesign --deep`
+fails on it anywhere in `Contents/MacOS` or `Contents/Frameworks`.
+
+**Not tested:** anything on Windows (the PowerShell fetch script, the `.pro` copy
+rule, the deploy step, the console-window suppression), the Developer ID
+signature and notarization (they need the certificate and Apple credentials),
+and the GitHub Actions edits (none has been run). Windows signing needs no
+change: the runtime's files are already signed by the Python Software
+Foundation, and the signing workflow does not set the action to recurse into
+subfolders (worth confirming).
+
+**Not yet done:** testing against a real serial device (the serial write path
+that paces long lines is not exercised by the loopback test, only the TCP
+path) and compiling `.gs` source inside the app (phase 2).
+
 ## Trade-offs accepted
 
 - **A process launch per compile** and a bundled interpreter to ship, sign and
@@ -237,8 +392,8 @@ as a deliverable.
 - **Which devices?** The editor fetches the syscall table and command list
   from whichever device is selected (see "Compiling needs a connected
   device"); multi-device sessions need a set per connection.
-- **Qt versions.** The project files target both Qt 5 and Qt 6; the new code
-  should avoid Qt 6-only APIs.
+- **Qt version.** Qt 6 only (built and tested with 6.7.1; the app's own
+  `MIPS.pro` notes 6.8.2). Qt 5 is not a target, so new code may use Qt 6 APIs.
 - **Hardware verification.** The `GSYSCALLS` and hash-checking handlers in
   the firmware have so far only been exercised against a fake serial port;
   see `TODO.md`. The app work should not start before they have been run on
