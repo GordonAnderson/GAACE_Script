@@ -372,7 +372,7 @@ static void cmdSyscalls(void) {
 }
 
 // -----------------------------------------------------------------------
-// GSCRIPTST,<slot> — loaded(0|1),lastStatus
+// GSCRIPTST,<slot> — loaded(TRUE|FALSE),lastStatus
 // -----------------------------------------------------------------------
 static void cmdScriptStatus(void) {
   commandProcessor &cp = *activeInstance->cp_;
@@ -426,7 +426,7 @@ static Command scriptCmds[] = {
   {"GSCRIPTLIMITS", CMDfunction, 0, (void *)cmdScriptLimits, NULL,
    "slots,maxCodeLen,stackSize,varSlots,maxSyscalls"},
   {"GSCRIPTST",     CMDfunction, 1, (void *)cmdScriptStatus, NULL,
-   "GSCRIPTST,<slot> -- loaded(0|1),lastStatus"},
+   "GSCRIPTST,<slot> -- loaded(TRUE|FALSE),lastStatus"},
   {"GSCRIPTVAR",    CMDfunction, 2, (void *)cmdScriptVar, NULL,
    "GSCRIPTVAR,<slot>,<var> -- variable as <int>,<float> (debugging)"},
   {NULL}

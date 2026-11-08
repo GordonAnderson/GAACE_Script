@@ -77,7 +77,7 @@
 //                             combined, not code alone -- this is the ceiling
 //                             SCRIPTAPPEND/SCRIPTCOMMIT assemble up to, not
 //                             SCRIPTLOAD's one-call limit)
-//   GSCRIPTST,<slot>          loaded(0|1),lastStatus  (see GAACEScript.h's
+//   GSCRIPTST,<slot>          loaded(TRUE|FALSE),lastStatus  (see GAACEScript.h's
 //                             Status enum; 1 = VM_HALTED)
 //
 // cmd() support: every slot gets a working CMDCALL bridge automatically

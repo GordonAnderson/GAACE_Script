@@ -121,7 +121,7 @@ only genuinely new commands are:
 | `GSYSCALLS` | The registered syscall table: `count,hash`, then `index,name,argc,int\|float` per syscall — see "Syscall tables" below. NAKs if the project never called `registerSyscalls()`. |
 | `SCRIPTLOAD,<slot>,<hex>[,<hash>]` | Decode `<hex>` (`gsc.py --scriptload --format hex`, i.e. `[codeLen][code][pool]`) and load it into `<slot>`. NAKs on a bad slot, malformed hex, or a payload over the configured size limit — never silently accepts something it can't run. |
 | `GSCRIPTLIMITS` | `slots,maxCodeLen,stackSize,varSlots,maxSyscalls` — lets a host discover the compile-time limits below at runtime instead of hardcoding them. |
-| `GSCRIPTST,<slot>` | `loaded(0\|1),lastStatus` — the one piece of VM-specific state `threadCommands` doesn't know about. |
+| `GSCRIPTST,<slot>` | `loaded(TRUE\|FALSE),lastStatus` — the one piece of VM-specific state `threadCommands` doesn't know about. |
 | `GSCRIPTVAR,<slot>,<var>` | A script variable, for debugging: `<as int>,<as float>` (variables carry no type, so both readings of the 32 bits are given). `<var>` is the slot number `gsc.py --disasm` shows for `LOAD`/`STORE`. |
 
 `SCRIPTLOAD` and `SCRIPTCOMMIT` take an optional trailing `<hash>` (the

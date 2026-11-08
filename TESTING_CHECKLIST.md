@@ -44,27 +44,29 @@ tools, and vice versa.
 
 ---
 
+> **Status (2026-11-08):** ticked boxes below passed on real hardware. See the results table at the end.
+
 ## A. Firmware
 
-- [ ] **A1. Flash current firmware.** From `USBrepeater`: `pio run -t upload`. It
+- [x] **A1. Flash current firmware.** From `USBrepeater`: `pio run -t upload`. It
   pulls the library's branch head (`GAACE_Script` `main`), so it includes the syscall
   table, the hash check and typed `cmd()` arguments. (If the build seems stale,
   check the "Dependency Graph" in the build output shows the latest commit.)
-- [ ] **A2. It boots and answers.** `$PY examples/hwtest/send.py PORT GVER GNAME`
+- [x] **A2. It boots and answers.** `$PY examples/hwtest/send.py PORT GVER GNAME`
   -> `[ACK]` and a version / name.
-- [ ] **A3. Script limits.** `send.py PORT GSCRIPTLIMITS` -> `[ACK]4,2048,32,16,32`
+- [x] **A3. Script limits.** `send.py PORT GSCRIPTLIMITS` -> `[ACK]4,2048,32,16,32`
   (slots, bytes per slot, stack, variables, max syscalls; these are the expected
   values from the defaults, and the 2048 comes from `GAACE_SCRIPT_MAX_CODE_LEN` in
   `platformio.ini`).
-- [ ] **A4. Syscall table.** `send.py PORT GSYSCALLS` -> `[ACK]6,6501A214` then
+- [x] **A4. Syscall table.** `send.py PORT GSYSCALLS` -> `[ACK]6,6501A214` then
   `0,link_ready,0,int`, `1,read_adc,0,int`, `2,scale_send,1,int`,
   `3,dio_set_dir,1,int`, `4,dio_write,1,int`, `5,dio_read,0,int`.
   **If the hash differs** the table or the hash code disagrees with `gsc.py`
   (`python3 tools/gsc.py --list-syscalls PORT` recomputes it): stop and tell me.
-- [ ] **A5. Command list.** `send.py PORT GCMDS` -> `[ACK]` and a long list of
+- [x] **A5. Command list.** `send.py PORT GCMDS` -> `[ACK]` and a long list of
   `NAME,help` lines that includes `SCRIPTLOAD`, `SCRIPTAPPEND`, `SCRIPTCOMMIT`,
   `GSCRIPTST`, `GSYSCALLS`, `ADCFILTER`-family names (`GADCFILTER`, `SADCFILTER`).
-- [ ] **A6. Slot status.** `send.py PORT GSCRIPTST,1` -> `[ACK]0,0` (empty).
+- [x] **A6. Slot status.** `send.py PORT GSCRIPTST,1` -> `[ACK]FALSE,0` (empty).
 
 ## B. The command-line compiler, no Qt app
 
@@ -85,7 +87,7 @@ Close the app. From `GAACE_Script`:
   $PY examples/hwtest/send.py PORT GSCRIPTST,1 STINT,Script1,500 STENA,Script1,TRUE
   $PY examples/hwtest/send.py PORT GSCRIPTVAR,1,0 GBAUD
   ```
-  `GSCRIPTST,1` shows `1,...` (loaded). `GSCRIPTVAR,1,0` shows the baud rate as the
+  `GSCRIPTST,1` shows `TRUE,...` (loaded). `GSCRIPTVAR,1,0` shows the baud rate as the
   first number, matching `GBAUD`. Stop it: `send.py PORT STENA,Script1,FALSE`.
 - [ ] **B4. T2: a float argument and a float reply.** First note the current value:
   `send.py PORT GADCFILTER` (original = ______). Upload `t2_float.gs` to slot 1 the
@@ -103,7 +105,7 @@ Close the app. From `GAACE_Script`:
   character lines over real serial, which the fakes could not test.)
 - [ ] **B7. A stale hash is refused.** Using the tiny script `x = 1;`:
   `send.py PORT SCRIPTLOAD,1,08000101000000050000,DEADBEEF` -> `[NAK]?`, and
-  `GSCRIPTST,1` afterwards shows `0,...`: the slot is **not** left loaded with a rejected script.
+  `GSCRIPTST,1` afterwards shows `FALSE,...`: the slot is **not** left loaded with a rejected script.
   Then without the hash: `send.py PORT SCRIPTLOAD,1,08000101000000050000` -> `[ACK]`.
 - [ ] **B8. A bad command name is only a warning.** Compile
   `printf 'cmd("SDRW", 1);' | $PY tools/gsc.py - --commands /tmp/ubcmds.json --json`
@@ -119,35 +121,35 @@ folder `qmake /path/to/MIPS_QT6/MIPS.pro && make`. Optional first:
 `tools/python/fetch_python.sh` to build in the bundled Python (without it the app
 uses a `python3` from your PATH).
 
-- [ ] **C1. It runs and sees the device.** Connect as you normally do
+- [x] **C1. It runs and sees the device.** Connect as you normally do
   (Connect or Search). The USBrepeater should appear as a system. The app finds systems by
   asking `GVER` and looking for "Version" in the reply: **if the USBrepeater
   does not appear, tell me what `GVER` returns.**
 - [ ] **C2. About.** The About menu -> About shows "Device Scripts compiler: gsc 1.2.1, Python
   x.y.z" (and the right Python if you ran the fetch script: 3.14.10).
-- [ ] **C3. Open Tools -> Device Scripts.** The system, "4 script slots, 2048 bytes
+- [x] **C3. Open Tools -> Device Scripts.** The system, "4 script slots, 2048 bytes
   per slot", the 6 syscalls and hash `6501A214` are shown, and the log's first line
   names the Python and `gsc.py` being used.
-- [ ] **C4. Check and Send, a command script.** Open `examples/hwtest/t1_int_reply.gs`
+- [x] **C4. Check and Send, a command script.** Open `examples/hwtest/t1_int_reply.gs`
   (Open...), Check -> "Compiled: 15 bytes". Select slot 1, Send -> "Sent 15 bytes to
   slot 1". Start slot, then confirm with `GSCRIPTVAR,1,0` in the app's Terminal tab. Stop slot.
-- [ ] **C5. Float.** `t2_float.gs` the same way; confirm `GADCFILTER` reads 12.5; restore it.
-- [ ] **C6. Syscalls and the hash.** `t3_syscalls.gs`: the log says "(checked against
+- [x] **C5. Float.** `t2_float.gs` the same way; confirm `GADCFILTER` reads 12.5; restore it.
+- [x] **C6. Syscalls and the hash.** `t3_syscalls.gs`: the log says "(checked against
   table hash 6501A214)". A script with no syscalls (T1) does not mention a hash.
-- [ ] **C7. Chunked upload.** `t4_chunked.gs`: Send works, the progress bar moves, and
+- [x] **C7. Chunked upload.** `t4_chunked.gs`: Send works, the progress bar moves, and
   the slot shows loaded (Slot status).
-- [ ] **C8. Errors are located.** Type `y = ;` on line 3 of a script: Check puts the cursor
+- [x] **C8. Errors are located.** Type `y = ;` on line 3 of a script: Check puts the cursor
   and a red mark on line 3, lists "Error: line 3, column 5: ...", and Send does nothing.
   Click the entry to jump to it; editing clears it.
-- [ ] **C9. Warnings.** `cmd("SDRW", 1);` -> "Warning: ... the device has no command
+- [x] **C9. Warnings.** `cmd("SDRW", 1);` -> "Warning: ... the device has no command
   'SDRW'" with a suggestion; Send still works.
-- [ ] **C10. Replace prompt.** Send to a slot that already has a script: it asks first;
+- [x] **C10. Replace prompt.** Send to a slot that already has a script: it asks first;
   "No" leaves it alone.
-- [ ] **C11. Too big.** A script over 2048 bytes (`for i in $(seq 400); do echo 'x = cmd("GBAUD");'; done > big.gs`)
+- [x] **C11. Too big.** A script over 2048 bytes (`for i in $(seq 400); do echo 'x = cmd("GBAUD");'; done > big.gs`)
   is refused with "a slot holds 2048" before anything is sent.
-- [ ] **C12. Save / Open / unsaved changes.** Save As a `.gs`, reopen it; close the dialog
+- [x] **C12. Save / Open / unsaved changes.** Save As a `.gs`, reopen it; close the dialog
   with unsaved edits -> it asks.
-- [ ] **C13. Unplug mid-use.** Unplug the USB while the dialog is open, press Refresh /
+- [x] **C13. Unplug mid-use.** Unplug the USB while the dialog is open, press Refresh /
   Send: a clear "not connected" message, no crash or hang. Plug back in, search again.
 - [ ] **C14. Other app features still work** while the dialog is open (control panels,
   terminal): the new `Comms::Transact()` shares the serial port with them.
@@ -186,4 +188,4 @@ or the compiler. **A and B pass, C fails** -> the Qt app.
 
 | Date | Tester | Firmware commit | App commit (`dev`) | Sections passed | Notes |
 | --- | --- | --- | --- | --- | --- |
-|  |  |  |  |  |  |
+| 2026-11-08 | Gordon Anderson (A-steps run from the command line with Claude) | USBrepeater `95bb2f5` + GAACE_Script `467964d`, GAACEgateway 1.1 | MIPS_QT6 `dev` `aa24d15` | A1-A6, C1, C3-C13 | Two bugs found and fixed: GSCRIPTST replies TRUE/FALSE (not 1/0), and the replace prompt was skipped when the status could not be read. Not yet run: B1-B9 (command-line compiler against the device), C2, C14, C15, D, E. First flash attempt failed with "error writing to Teensy" (documented), second worked. |

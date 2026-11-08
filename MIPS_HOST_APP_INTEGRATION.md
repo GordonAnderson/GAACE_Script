@@ -364,9 +364,20 @@ change: the runtime's files are already signed by the Python Software
 Foundation, and the signing workflow does not set the action to recurse into
 subfolders (worth confirming).
 
-**Not yet done:** testing against a real serial device (the serial write path
-that paces long lines is not exercised by the loopback test, only the TCP
-path) and compiling `.gs` source inside the app (phase 2).
+### Hardware results (2026-11-08)
+
+First run on a real USBrepeater (Teensy 4.1, alone, no downstream device), from the Mac
+app. Passed: the device is found; limits, syscall table (hash `6501A214` matches the
+firmware's), and the 92-command `GCMDS` list over real USB serial; compile, check and
+send for a command script, a float-argument script (`SADCFILTER,12.5` read back as
+12.5), a syscall script (sent with the hash), and a chunked 429-byte upload (reassembled
+correctly: it ran and returned the right value); located errors and the unknown-command
+warning; the replace prompt; oversize refusal; save/open; unplugging mid-use.
+
+Two bugs only hardware could show, both fixed: `GSCRIPTST` prints `TRUE`/`FALSE` for the
+loaded flag (our docs and fakes said `0|1`), and the replace prompt was skipped when that
+reply could not be parsed. See `TESTING_CHECKLIST.md` for what is still untested
+(the command-line compiler against the device, Windows, notarization).
 
 ## Trade-offs accepted
 
