@@ -218,7 +218,7 @@ LOGIC_OPS = {"&&", "||"}
 
 # Bumped when the CLI or its --json output changes in a way a host program
 # (the MIPS Qt app runs this as a subprocess) could notice.
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 
 class CompileError(Exception):
@@ -1590,6 +1590,12 @@ def _open_port(port, baud, timeout):
         import serial
     except ImportError:
         print("error: --upload requires pyserial -- pip install pyserial", file=sys.stderr)
+        return None
+    if not hasattr(serial, "Serial"):
+        # The PyPI package named "serial" is a different project that also
+        # installs a module called serial.
+        print("error: the 'serial' module found here is not pyserial -- "
+              "pip uninstall serial; pip install pyserial", file=sys.stderr)
         return None
 
     try:

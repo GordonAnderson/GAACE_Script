@@ -307,6 +307,10 @@ python3 gsc.py program.gs --commands cmds.json ...     # warn about unknown cmd(
 python3 gsc.py --version                               # gsc 1.2.0
 ```
 
+`--upload`, `--list-syscalls` and `--list-commands` need pyserial. If you see "the
+'serial' module found here is not pyserial", the PyPI package named `serial` (a
+different project) is installed: `pip uninstall serial; pip install pyserial`.
+
 ### Compile errors
 
 A compile error is reported with its location:

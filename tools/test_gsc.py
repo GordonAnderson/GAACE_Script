@@ -1013,6 +1013,17 @@ class JsonModeTests(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), f"gsc {gsc.__version__}")
 
 
+class WrongSerialModuleTests(unittest.TestCase):
+    def test_a_serial_module_that_is_not_pyserial_gets_a_clear_error(self):
+        not_pyserial = type(sys)("serial")          # a module with no Serial class
+        with mock.patch.dict(sys.modules, {"serial": not_pyserial}), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            port = gsc._open_port("FAKE", 115200, 1.0)
+        self.assertIsNone(port)
+        self.assertIn("not pyserial", err.getvalue())
+        self.assertIn("pip install pyserial", err.getvalue())
+
+
 class CommandListCliTests(unittest.TestCase):
     def _run_json(self, source, *extra):
         with tempfile.TemporaryDirectory() as d:
