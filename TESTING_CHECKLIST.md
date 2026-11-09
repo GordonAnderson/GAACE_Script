@@ -44,7 +44,7 @@ tools, and vice versa.
 
 ---
 
-> **Status (2026-11-09):** ticked boxes below passed on real hardware. See the results table at the end.
+> **Status (2026-11-09):** every box below has passed on real hardware. See the results table at the end.
 
 ## A. Firmware
 
@@ -160,12 +160,12 @@ uses a `python3` from your PATH).
 
 ## D. Packaging (macOS only here)
 
-- [ ] **D1.** `tools/python/fetch_python.sh`, rebuild: `MIPS.app/Contents/Resources/python`
+- [x] **D1.** `tools/python/fetch_python.sh`, rebuild: `MIPS.app/Contents/Resources/python`
   and `gsc.py` exist, and C2 shows Python 3.14.10.
-- [ ] **D2.** Sign the way the release workflow does: `tools/python/sign_macos_python.sh
+- [x] **D2.** Sign the way the release workflow does: `tools/python/sign_macos_python.sh
   MIPS.app` then `codesign --deep --force --sign - MIPS.app` and `codesign --verify --deep
   --strict MIPS.app` -> no errors; Device Scripts still compiles from the signed bundle.
-- [ ] **D3.** Move the app to a different folder (or Mac) and run it from there: it still
+- [x] **D3.** Move the app to a different folder (or Mac) and run it from there: it still
   finds its Python.
 
 ## E. Needs a downstream device (optional)
@@ -206,4 +206,4 @@ or the compiler. **A and B pass, C fails** -> the Qt app.
 | Date | Tester | Firmware commit | App commit (`dev`) | Sections passed | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 2026-11-08 | Gordon Anderson (A-steps run from the command line with Claude) | USBrepeater `95bb2f5` + GAACE_Script `467964d`, GAACEgateway 1.1 | MIPS_QT6 `dev` `aa24d15` | A1-A6, C1, C3-C13 | Two bugs found and fixed: GSCRIPTST replies TRUE/FALSE (not 1/0), and the replace prompt was skipped when the status could not be read. Not yet run: B1-B9 (command-line compiler against the device), C2, C14, C15, D, E. First flash attempt failed with "error writing to Teensy" (documented), second worked. |
-| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | B1-B9, C2, C14, C15, E1, E2, E3 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. E3 (`t5_link_send.gs`): `link_ready`/`scale_send` worked against RFgen; a negative input sends a negative SDRV, which RFgen rejects (drive shows 0). B1-B9 run from the command line by Claude (control port `/dev/cu.usbmodem211425603`): hash `6501A214`, 91 commands; T1 baud 115200; T2 12.5 (ADCFILTER restored to 0.00); T3 ADC 2441 counts, DIO 0 (input not varied); T4 3 chunks + commit; DEADBEEF hash NAKed and slot left unloaded; SDRW warning only (no suggestion: no close name on the repeater). Firmware help text for GSCRIPTST still says `loaded(0|1)` though it replies TRUE/FALSE. B9: `x = 1;` saved to slot 1, power-cycled, slot 1 reloaded by itself (`TRUE,1`), then SCRIPTERASE,1. C2: the compiler/Python line shows; the About links were out of date (old Google Drive folder), updated in MIPS_QT6 `aboutdialog.cpp` to www.GAACustom.com (documentation) and the MIPS_QT6 GitHub releases page (install files). C15: `examples/hwtest/t1_int_reply.hex` (T1, `--scriptload --format hex`) sent from the app to slot 1; `GSCRIPTVAR,1,0` = 115200 = `GBAUD`, no errors. Still not run: D. |
+| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | B1-B9, C2, C14, C15, D1-D3, E1, E2, E3 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. E3 (`t5_link_send.gs`): `link_ready`/`scale_send` worked against RFgen; a negative input sends a negative SDRV, which RFgen rejects (drive shows 0). B1-B9 run from the command line by Claude (control port `/dev/cu.usbmodem211425603`): hash `6501A214`, 91 commands; T1 baud 115200; T2 12.5 (ADCFILTER restored to 0.00); T3 ADC 2441 counts, DIO 0 (input not varied); T4 3 chunks + commit; DEADBEEF hash NAKed and slot left unloaded; SDRW warning only (no suggestion: no close name on the repeater). Firmware help text for GSCRIPTST still says `loaded(0|1)` though it replies TRUE/FALSE. B9: `x = 1;` saved to slot 1, power-cycled, slot 1 reloaded by itself (`TRUE,1`), then SCRIPTERASE,1. C2: the compiler/Python line shows; the About links were out of date (old Google Drive folder), updated in MIPS_QT6 `aboutdialog.cpp` to www.GAACustom.com (documentation) and the MIPS_QT6 GitHub releases page (install files). C15: `examples/hwtest/t1_int_reply.hex` (T1, `--scriptload --format hex`) sent from the app to slot 1; `GSCRIPTVAR,1,0` = 115200 = `GBAUD`, no errors. D1: fetch_python.sh got Python 3.14.10 (47 MB, checksum OK); scratch build with Qt 6.7.1 put `python` and `gsc.py` in `Contents/Resources`; About shows gsc 1.2.1 / Python 3.14.10 and the Device Scripts log names the bundled Python. D2: sign_macos_python.sh (3 Mach-O files; extensions are built in) + `codesign --deep --force --sign -`; `codesign --verify --deep --strict` passes, Python runs with the hardened runtime, bundle still valid after compiling. D3: signed copy moved to a folder with a space in its name: still valid, the app's log names the moved copy's Python. Build warning: Homebrew libzmq is built for macOS 26 but the app targets 11.0. **All sections now passed.** |
