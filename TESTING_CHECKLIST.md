@@ -44,7 +44,7 @@ tools, and vice versa.
 
 ---
 
-> **Status (2026-11-08):** ticked boxes below passed on real hardware. See the results table at the end.
+> **Status (2026-11-09):** ticked boxes below passed on real hardware. See the results table at the end.
 
 ## A. Firmware
 
@@ -151,8 +151,10 @@ uses a `python3` from your PATH).
   with unsaved edits -> it asks.
 - [x] **C13. Unplug mid-use.** Unplug the USB while the dialog is open, press Refresh /
   Send: a clear "not connected" message, no crash or hang. Plug back in, search again.
-- [ ] **C14. Other app features still work** while the dialog is open (control panels,
+- [x] **C14. Other app features still work** while the dialog is open (control panels,
   terminal): the new `Comms::Transact()` shares the serial port with them.
+  (2026-11-09: an RFgen control panel ran alongside Device Scripts and a running
+  script; both worked.)
 - [ ] **C15. Hex path.** Tick "Send a precompiled .hex file instead", pick a `--scriptload
   --format hex` file, Send.
 
@@ -168,6 +170,14 @@ uses a `python3` from your PATH).
 
 ## E. Needs a downstream device (optional)
 
+- [x] **E1. `device()` / `ready()` / `dcmd()`.** With an instrument named `RFgen` on the
+  repeater: `rf = device("RFgen"); if (ready(rf)) { ok = dcmd(rf, "SDRV", 10); }`
+  sets RFgen's drive to 10 and `ok` reads 1.
+- [x] **E2. Full system test: ADC -> RFgen drive.** `examples/hwtest/rfgen_drive.gs`
+  reads the ADC (`read_adc()`), converts to volts with the repeater's own calibration
+  (`cmdf("GADCM")`, `cmdf("GADCB")`), maps 0..10 V to 0..100% (clamped), and sends it
+  with `dcmd(rf, "SDRV", drv)`. Check: -5 V in -> 0%; the drive follows the input; the
+  RFgen control panel keeps working while the script runs.
 - [ ] `link_ready()` returns nonzero once the device is connected and identified; `scale_send(n)`
   sends the scaled value to it. Slot 0's built-in ADC demo does this on its own.
 
@@ -189,3 +199,4 @@ or the compiler. **A and B pass, C fails** -> the Qt app.
 | Date | Tester | Firmware commit | App commit (`dev`) | Sections passed | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 2026-11-08 | Gordon Anderson (A-steps run from the command line with Claude) | USBrepeater `95bb2f5` + GAACE_Script `467964d`, GAACEgateway 1.1 | MIPS_QT6 `dev` `aa24d15` | A1-A6, C1, C3-C13 | Two bugs found and fixed: GSCRIPTST replies TRUE/FALSE (not 1/0), and the replace prompt was skipped when the status could not be read. Not yet run: B1-B9 (command-line compiler against the device), C2, C14, C15, D, E. First flash attempt failed with "error writing to Teensy" (documented), second worked. |
+| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | C14, E1, E2 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. Still not run: B1-B9, C2, C15, D, and the `link_ready`/`scale_send` item in E. |
