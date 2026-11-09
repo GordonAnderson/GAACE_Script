@@ -178,8 +178,15 @@ uses a `python3` from your PATH).
   (`cmdf("GADCM")`, `cmdf("GADCB")`), maps 0..10 V to 0..100% (clamped), and sends it
   with `dcmd(rf, "SDRV", drv)`. Check: -5 V in -> 0%; the drive follows the input; the
   RFgen control panel keeps working while the script runs.
-- [ ] `link_ready()` returns nonzero once the device is connected and identified; `scale_send(n)`
-  sends the scaled value to it. Slot 0's built-in ADC demo does this on its own.
+- [x] **E3. `link_ready()` / `scale_send()`.** Both use the repeater's ADC target and
+  command prefix, not a name in the script. Stop anything else sending the same command
+  (other slots, `SADCEN,FALSE`), note `GADCDEV` / `GADCCMD`, then `SADCDEV,RFgen` and
+  `SADCCMD,SDRV`. Load `examples/hwtest/t5_link_send.gs` into slot 1 and start it:
+  variable 0 (`linked`) = 1, variable 2 (`sent`) = 1, and RFgen's drive equals the input
+  in volts (`scale_send` applies only ADCM/ADCB, so 5 V sends `SDRV,5.000`; there is no
+  clamp). A negative input sends a negative drive, which RFgen rejects (drive shows 0).
+  Optional: `SADCDEV,NoSuchName` -> `linked` = 0; slot 0's built-in demo
+  (`STENA,Script0,TRUE`) does the same on its own. Restore `SADCDEV` / `SADCCMD` afterwards.
 
 ---
 
@@ -199,4 +206,4 @@ or the compiler. **A and B pass, C fails** -> the Qt app.
 | Date | Tester | Firmware commit | App commit (`dev`) | Sections passed | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 2026-11-08 | Gordon Anderson (A-steps run from the command line with Claude) | USBrepeater `95bb2f5` + GAACE_Script `467964d`, GAACEgateway 1.1 | MIPS_QT6 `dev` `aa24d15` | A1-A6, C1, C3-C13 | Two bugs found and fixed: GSCRIPTST replies TRUE/FALSE (not 1/0), and the replace prompt was skipped when the status could not be read. Not yet run: B1-B9 (command-line compiler against the device), C2, C14, C15, D, E. First flash attempt failed with "error writing to Teensy" (documented), second worked. |
-| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | C14, E1, E2 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. Still not run: B1-B9, C2, C15, D, and the `link_ready`/`scale_send` item in E. |
+| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | C14, E1, E2, E3 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. E3 (`t5_link_send.gs`): `link_ready`/`scale_send` worked against RFgen; a negative input sends a negative SDRV, which RFgen rejects (drive shows 0). Still not run: B1-B9, C2, C15, D. |
