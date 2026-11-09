@@ -72,15 +72,15 @@ tools, and vice versa.
 
 Close the app. From `GAACE_Script`:
 
-- [ ] **B1. Read the table and commands.**
+- [x] **B1. Read the table and commands.**
   `$PY tools/gsc.py --list-syscalls PORT --save-syscalls /tmp/ub.json` prints
   6 syscalls and hash `6501A214`;
   `$PY tools/gsc.py --list-commands PORT --save-commands /tmp/ubcmds.json` prints the
   command list. Both files are written.
-- [ ] **B2. Compile offline against the saved table.**
+- [x] **B2. Compile offline against the saved table.**
   `$PY tools/gsc.py examples/hwtest/t3_syscalls.gs --syscalls /tmp/ub.json --disasm`
   shows `CALL` instructions and no errors.
-- [ ] **B3. T1: integer reply.**
+- [x] **B3. T1: integer reply.**
   `$PY tools/gsc.py examples/hwtest/t1_int_reply.gs --upload PORT --slot 1` -> `OK:
   script loaded into slot 1 (... single SCRIPTLOAD)`. Then run it and read the result:
   ```
@@ -89,25 +89,25 @@ Close the app. From `GAACE_Script`:
   ```
   `GSCRIPTST,1` shows `TRUE,...` (loaded). `GSCRIPTVAR,1,0` shows the baud rate as the
   first number, matching `GBAUD`. Stop it: `send.py PORT STENA,Script1,FALSE`.
-- [ ] **B4. T2: a float argument and a float reply.** First note the current value:
+- [x] **B4. T2: a float argument and a float reply.** First note the current value:
   `send.py PORT GADCFILTER` (original = ______). Upload `t2_float.gs` to slot 1 the
   same way, start it (`STENA,Script1,TRUE`), then
   `send.py PORT GADCFILTER GSCRIPTVAR,1,0` -> `GADCFILTER` now reads **12.5** (this is
   the point of the test: before the fix it would have been a huge integer), and
   variable 0 shows 12.5 as its float reading. **Stop the slot and restore:**
   `send.py PORT STENA,Script1,FALSE SADCFILTER,<original>`.
-- [ ] **B5. T3: syscalls.** `$PY tools/gsc.py examples/hwtest/t3_syscalls.gs --upload PORT
+- [x] **B5. T3: syscalls.** `$PY tools/gsc.py examples/hwtest/t3_syscalls.gs --upload PORT
   --slot 1` (it asks the device for the table; the load is stamped with the hash).
   Start it; `GSCRIPTVAR,1,0` is a plausible raw ADC reading (it changes if the AIN input
   changes), `GSCRIPTVAR,1,1` is 0 or 1. Stop it.
-- [ ] **B6. T4: chunked upload.** Upload `t4_chunked.gs` to slot 1 -> `OK: ... 3
+- [x] **B6. T4: chunked upload.** Upload `t4_chunked.gs` to slot 1 -> `OK: ... 3
   SCRIPTAPPEND chunks + SCRIPTCOMMIT`. `GSCRIPTST,1` -> loaded. (This sends ~400
   character lines over real serial, which the fakes could not test.)
-- [ ] **B7. A stale hash is refused.** Using the tiny script `x = 1;`:
+- [x] **B7. A stale hash is refused.** Using the tiny script `x = 1;`:
   `send.py PORT SCRIPTLOAD,1,08000101000000050000,DEADBEEF` -> `[NAK]?`, and
   `GSCRIPTST,1` afterwards shows `FALSE,...`: the slot is **not** left loaded with a rejected script.
   Then without the hash: `send.py PORT SCRIPTLOAD,1,08000101000000050000` -> `[ACK]`.
-- [ ] **B8. A bad command name is only a warning.** Compile
+- [x] **B8. A bad command name is only a warning.** Compile
   `printf 'cmd("SDRW", 1);' | $PY tools/gsc.py - --commands /tmp/ubcmds.json --json`
   -> `ok: true` with one warning and "did you mean ...?" if a close name exists.
 - [ ] **B9. Optional: survives a reboot.** With a script in slot 1: `send.py PORT
@@ -206,4 +206,4 @@ or the compiler. **A and B pass, C fails** -> the Qt app.
 | Date | Tester | Firmware commit | App commit (`dev`) | Sections passed | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 2026-11-08 | Gordon Anderson (A-steps run from the command line with Claude) | USBrepeater `95bb2f5` + GAACE_Script `467964d`, GAACEgateway 1.1 | MIPS_QT6 `dev` `aa24d15` | A1-A6, C1, C3-C13 | Two bugs found and fixed: GSCRIPTST replies TRUE/FALSE (not 1/0), and the replace prompt was skipped when the status could not be read. Not yet run: B1-B9 (command-line compiler against the device), C2, C14, C15, D, E. First flash attempt failed with "error writing to Teensy" (documented), second worked. |
-| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | C14, E1, E2, E3 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. E3 (`t5_link_send.gs`): `link_ready`/`scale_send` worked against RFgen; a negative input sends a negative SDRV, which RFgen rejects (drive shows 0). Still not run: B1-B9, C2, C15, D. |
+| 2026-11-09 | Gordon Anderson (with Claude) | USBrepeater `b3f7c60` + GAACE_Script `5892914` | MIPS_QT6 `dev` `aa24d15` | B1-B8, C14, E1, E2, E3 | Device scripts drove a downstream instrument (`RFgen`) for the first time, with its control panel open. First version of `rfgen_drive.gs` divided raw ADC counts by 24 (-5 V gave 47.58%); fixed by converting counts to volts with GADCM/GADCB first. E3 (`t5_link_send.gs`): `link_ready`/`scale_send` worked against RFgen; a negative input sends a negative SDRV, which RFgen rejects (drive shows 0). B1-B8 run from the command line by Claude (control port `/dev/cu.usbmodem211425603`): hash `6501A214`, 91 commands; T1 baud 115200; T2 12.5 (ADCFILTER restored to 0.00); T3 ADC 2441 counts, DIO 0 (input not varied); T4 3 chunks + commit; DEADBEEF hash NAKed and slot left unloaded; SDRW warning only (no suggestion: no close name on the repeater). Firmware help text for GSCRIPTST still says `loaded(0|1)` though it replies TRUE/FALSE. Still not run: B9, C2, C15, D. |
